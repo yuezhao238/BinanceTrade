@@ -1,0 +1,9 @@
+services:
+  trader:
+    build: .
+    env_file:
+      - .env
+    volumes:
+      - ./var:/app/var
+    restart: unless-stopped
+    command: ["binance-trade", "doctor"]

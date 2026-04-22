@@ -1,0 +1,183 @@
+from __future__ import annotations
+
+import logging
+from decimal import Decimal
+from typing import Any
+
+import httpx
+
+from .config import Settings
+from .exceptions import BinanceAPIError, BinanceExecutionUnknown, ConfigError
+from .filters import SymbolRules, parse_symbol_rules
+from .signing import Authenticator
+from .types import OrderRequest
+
+LOGGER = logging.getLogger(__name__)
+
+
+class BinanceSpotRestClient:
+    def __init__(self, settings: Settings, authenticator: Authenticator | None = None) -> None:
+        self.settings = settings
+        self.authenticator = authenticator
+        headers = {"User-Agent": "binance-trade/0.1.0"}
+        if authenticator:
+            headers["X-MBX-APIKEY"] = authenticator.api_key
+        self._client = httpx.AsyncClient(
+            base_url=self.settings.resolved_rest_base_url,
+            timeout=self.settings.request_timeout_seconds,
+            headers=headers,
+        )
+        self._rules_cache: dict[str, SymbolRules] = {}
+
+    async def __aenter__(self) -> "BinanceSpotRestClient":
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        await self.close()
+
+    async def close(self) -> None:
+        await self._client.aclose()
+
+    async def _request_public(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+    ) -> Any:
+        response = await self._client.request(method.upper(), path, params=params)
+        return self._handle_response(response)
+
+    async def _request_signed(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+    ) -> Any:
+        if not self.authenticator:
+            raise ConfigError("API credentials are required for signed requests")
+
+        payload = self.authenticator.build_rest_signed_payload(params or {})
+        method = method.upper()
+        if method in {"GET", "DELETE"}:
+            response = await self._client.request(method, f"{path}?{payload}")
+        else:
+            response = await self._client.request(
+                method,
+                path,
+                content=payload,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+        return self._handle_response(response)
+
+    def _handle_response(self, response: httpx.Response) -> Any:
+        if response.status_code >= 400:
+            self._raise_for_status(response)
+        if not response.content:
+            return {}
+        try:
+            return response.json()
+        except ValueError:
+            return response.text
+
+    def _raise_for_status(self, response: httpx.Response) -> None:
+        retry_after = response.headers.get("Retry-After")
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = {"msg": response.text}
+
+        code = payload.get("code") if isinstance(payload, dict) else None
+        message = payload.get("msg") if isinstance(payload, dict) else str(payload)
+        error_cls: type[BinanceAPIError] = BinanceAPIError
+        lowered = str(message).lower()
+        if code == -1007 or "status unknown" in lowered or "execution status unknown" in lowered:
+            error_cls = BinanceExecutionUnknown
+
+        raise error_cls(
+            http_status=response.status_code,
+            code=code,
+            message=str(message),
+            payload=payload,
+            retry_after=retry_after,
+        )
+
+    async def ping(self) -> bool:
+        await self._request_public("GET", "/api/v3/ping")
+        return True
+
+    async def server_time(self) -> int:
+        payload = await self._request_public("GET", "/api/v3/time")
+        return int(payload["serverTime"])
+
+    async def sync_time(self) -> int:
+        server_time = await self.server_time()
+        if self.authenticator:
+            self.authenticator.set_server_time(server_time)
+        return server_time
+
+    async def get_exchange_info(self, symbol: str | None = None) -> dict[str, Any]:
+        params = {"symbol": symbol.upper()} if symbol else None
+        return await self._request_public("GET", "/api/v3/exchangeInfo", params=params)
+
+    async def get_symbol_rules(self, symbol: str) -> SymbolRules:
+        symbol = symbol.upper()
+        cached = self._rules_cache.get(symbol)
+        if cached:
+            return cached
+        exchange_info = await self.get_exchange_info(symbol)
+        symbols = exchange_info.get("symbols", [])
+        if not symbols:
+            raise BinanceAPIError(http_status=404, message=f"symbol {symbol} not found in exchangeInfo")
+        rules = parse_symbol_rules(symbols[0])
+        self._rules_cache[symbol] = rules
+        return rules
+
+    async def get_price(self, symbol: str) -> Decimal:
+        payload = await self._request_public("GET", "/api/v3/ticker/price", params={"symbol": symbol.upper()})
+        return Decimal(str(payload["price"]))
+
+    async def get_account(self) -> dict[str, Any]:
+        return await self._request_signed("GET", "/api/v3/account")
+
+    async def place_order(self, order: OrderRequest) -> dict[str, Any]:
+        LOGGER.info("placing live order symbol=%s clientOrderId=%s", order.symbol, order.new_client_order_id)
+        return await self._request_signed("POST", "/api/v3/order", params=order.to_rest_params())
+
+    async def test_order(self, order: OrderRequest) -> dict[str, Any]:
+        LOGGER.info("sending test order symbol=%s clientOrderId=%s", order.symbol, order.new_client_order_id)
+        return await self._request_signed("POST", "/api/v3/order/test", params=order.to_rest_params())
+
+    async def get_order(
+        self,
+        symbol: str,
+        *,
+        client_order_id: str | None = None,
+        order_id: int | None = None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"symbol": symbol.upper()}
+        if client_order_id:
+            params["origClientOrderId"] = client_order_id
+        if order_id is not None:
+            params["orderId"] = order_id
+        return await self._request_signed("GET", "/api/v3/order", params=params)
+
+    async def cancel_order(
+        self,
+        symbol: str,
+        *,
+        client_order_id: str | None = None,
+        order_id: int | None = None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"symbol": symbol.upper()}
+        if client_order_id:
+            params["origClientOrderId"] = client_order_id
+        if order_id is not None:
+            params["orderId"] = order_id
+        return await self._request_signed("DELETE", "/api/v3/order", params=params)
+
+    async def get_open_orders(self, symbol: str | None = None) -> list[dict[str, Any]]:
+        params = {"symbol": symbol.upper()} if symbol else None
+        payload = await self._request_signed("GET", "/api/v3/openOrders", params=params)
+        return list(payload)
