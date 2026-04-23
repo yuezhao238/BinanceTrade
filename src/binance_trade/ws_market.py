@@ -9,18 +9,16 @@ from typing import Any
 
 import websockets
 
-from .config import Settings
-
 LOGGER = logging.getLogger(__name__)
 
 
 class MarketStreamClient:
-    def __init__(self, settings: Settings) -> None:
-        self.settings = settings
+    def __init__(self, base_url: str) -> None:
+        self.base_url = base_url
 
     def build_url(self, streams: list[str]) -> str:
         query = urllib.parse.urlencode({"streams": "/".join(streams)})
-        return f"{self.settings.resolved_market_ws_url}?{query}"
+        return f"{self.base_url}?{query}"
 
     async def listen(self, streams: list[str], *, reconnect: bool = True) -> AsyncIterator[dict[str, Any]]:
         backoff_seconds = 1

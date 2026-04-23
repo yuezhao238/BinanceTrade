@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from decimal import Decimal, ROUND_DOWN
 from typing import Any, Mapping
 
-from .types import OrderRequest, OrderType
+from .types import MarketType, OrderRequest, OrderType
 
 
 def _to_decimal(value: str | int | float | Decimal | None) -> Decimal | None:
@@ -80,20 +80,33 @@ class NotionalFilter:
 
 
 @dataclass(slots=True)
+class PercentPriceFilter:
+    multiplier_up: Decimal
+    multiplier_down: Decimal
+    multiplier_decimal: int | None = None
+
+
+@dataclass(slots=True)
 class SymbolRules:
     symbol: str
+    market_type: MarketType
     status: str
     base_asset: str
     quote_asset: str
+    margin_asset: str | None
+    contract_type: str | None
     order_types: set[str]
+    time_in_force_values: set[str]
     quote_order_qty_market_allowed: bool
     price_filter: PriceFilter | None
     lot_size: QuantityFilter | None
     market_lot_size: QuantityFilter | None
     min_notional: MinNotionalFilter | None
     notional: NotionalFilter | None
+    percent_price: PercentPriceFilter | None
     max_num_orders: int | None
     max_position: Decimal | None
+    trigger_protect: Decimal | None
 
     def adjust_price(self, price: Decimal) -> Decimal:
         if not self.price_filter:
@@ -121,6 +134,8 @@ class SymbolRules:
             reasons.append(f"symbol {self.symbol} is not TRADING")
         if order.order_type.value not in self.order_types:
             reasons.append(f"order type {order.order_type.value} is not enabled on {self.symbol}")
+        if order.time_in_force is not None and self.time_in_force_values and order.time_in_force.value not in self.time_in_force_values:
+            reasons.append(f"timeInForce {order.time_in_force.value} is not enabled on {self.symbol}")
         if order.quote_order_qty is not None and order.order_type is OrderType.MARKET and not self.quote_order_qty_market_allowed:
             reasons.append(f"symbol {self.symbol} does not allow quoteOrderQty market orders")
 
@@ -148,10 +163,14 @@ class SymbolRules:
     def summary(self) -> dict[str, Any]:
         return {
             "symbol": self.symbol,
+            "market_type": self.market_type.value,
             "status": self.status,
             "base_asset": self.base_asset,
             "quote_asset": self.quote_asset,
+            "margin_asset": self.margin_asset,
+            "contract_type": self.contract_type,
             "order_types": sorted(self.order_types),
+            "time_in_force": sorted(self.time_in_force_values),
             "quote_order_qty_market_allowed": self.quote_order_qty_market_allowed,
             "price_filter": None if not self.price_filter else {
                 "minPrice": str(self.price_filter.min_price),
@@ -178,12 +197,18 @@ class SymbolRules:
                 "applyMinToMarket": self.notional.apply_min_to_market,
                 "applyMaxToMarket": self.notional.apply_max_to_market,
             },
+            "percent_price": None if not self.percent_price else {
+                "multiplierUp": str(self.percent_price.multiplier_up),
+                "multiplierDown": str(self.percent_price.multiplier_down),
+                "multiplierDecimal": self.percent_price.multiplier_decimal,
+            },
             "max_num_orders": self.max_num_orders,
             "max_position": None if self.max_position is None else str(self.max_position),
+            "trigger_protect": None if self.trigger_protect is None else str(self.trigger_protect),
         }
 
 
-def parse_symbol_rules(symbol_info: Mapping[str, Any]) -> SymbolRules:
+def parse_symbol_rules(symbol_info: Mapping[str, Any], market_type: MarketType = MarketType.SPOT) -> SymbolRules:
     filters = {item["filterType"]: item for item in symbol_info.get("filters", [])}
 
     price_filter = filters.get("PRICE_FILTER")
@@ -191,15 +216,20 @@ def parse_symbol_rules(symbol_info: Mapping[str, Any]) -> SymbolRules:
     market_lot_size = filters.get("MARKET_LOT_SIZE")
     min_notional = filters.get("MIN_NOTIONAL")
     notional = filters.get("NOTIONAL")
+    percent_price = filters.get("PERCENT_PRICE")
     max_num_orders = filters.get("MAX_NUM_ORDERS")
     max_position = filters.get("MAX_POSITION")
 
     return SymbolRules(
         symbol=str(symbol_info["symbol"]).upper(),
+        market_type=market_type,
         status=str(symbol_info.get("status", "")),
         base_asset=str(symbol_info.get("baseAsset", "")),
         quote_asset=str(symbol_info.get("quoteAsset", "")),
+        margin_asset=None if symbol_info.get("marginAsset") is None else str(symbol_info.get("marginAsset")),
+        contract_type=None if symbol_info.get("contractType") is None else str(symbol_info.get("contractType")),
         order_types=set(symbol_info.get("orderTypes", [])),
+        time_in_force_values=set(symbol_info.get("timeInForce", [])),
         quote_order_qty_market_allowed=bool(symbol_info.get("quoteOrderQtyMarketAllowed", False)),
         price_filter=None if not price_filter else PriceFilter(
             min_price=_to_decimal(price_filter["minPrice"]) or Decimal("0"),
@@ -217,7 +247,7 @@ def parse_symbol_rules(symbol_info: Mapping[str, Any]) -> SymbolRules:
             step_size=_to_decimal(market_lot_size["stepSize"]) or Decimal("0"),
         ),
         min_notional=None if not min_notional else MinNotionalFilter(
-            min_notional=_to_decimal(min_notional["minNotional"]) or Decimal("0"),
+            min_notional=_to_decimal(min_notional.get("minNotional", min_notional.get("notional"))) or Decimal("0"),
             apply_to_market=bool(min_notional.get("applyToMarket", False)),
         ),
         notional=None if not notional else NotionalFilter(
@@ -226,6 +256,12 @@ def parse_symbol_rules(symbol_info: Mapping[str, Any]) -> SymbolRules:
             apply_min_to_market=bool(notional.get("applyMinToMarket", False)),
             apply_max_to_market=bool(notional.get("applyMaxToMarket", False)),
         ),
-        max_num_orders=None if not max_num_orders else int(max_num_orders["maxNumOrders"]),
+        percent_price=None if not percent_price else PercentPriceFilter(
+            multiplier_up=_to_decimal(percent_price["multiplierUp"]) or Decimal("0"),
+            multiplier_down=_to_decimal(percent_price["multiplierDown"]) or Decimal("0"),
+            multiplier_decimal=None if percent_price.get("multiplierDecimal") is None else int(percent_price["multiplierDecimal"]),
+        ),
+        max_num_orders=None if not max_num_orders else int(max_num_orders.get("maxNumOrders", max_num_orders.get("limit", 0))),
         max_position=_to_decimal(max_position["maxPosition"]) if max_position else None,
+        trigger_protect=_to_decimal(symbol_info.get("triggerProtect")),
     )

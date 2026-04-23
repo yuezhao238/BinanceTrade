@@ -9,7 +9,6 @@ from typing import Any
 
 import websockets
 
-from .config import Settings
 from .exceptions import ConfigError
 from .signing import Authenticator
 
@@ -17,8 +16,8 @@ LOGGER = logging.getLogger(__name__)
 
 
 class UserDataStreamClient:
-    def __init__(self, settings: Settings, authenticator: Authenticator | None) -> None:
-        self.settings = settings
+    def __init__(self, ws_api_url: str, authenticator: Authenticator | None) -> None:
+        self.ws_api_url = ws_api_url
         self.authenticator = authenticator
 
     async def _subscribe(self, websocket: Any) -> dict[str, Any]:
@@ -45,8 +44,8 @@ class UserDataStreamClient:
         backoff_seconds = 1
         while True:
             try:
-                LOGGER.info("connecting user stream url=%s", self.settings.resolved_ws_api_url)
-                async with websockets.connect(self.settings.resolved_ws_api_url, ping_interval=None, max_size=None) as websocket:
+                LOGGER.info("connecting user stream url=%s", self.ws_api_url)
+                async with websockets.connect(self.ws_api_url, ping_interval=None, max_size=None) as websocket:
                     subscribe_response = await self._subscribe(websocket)
                     yield subscribe_response
                     backoff_seconds = 1
