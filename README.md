@@ -60,6 +60,12 @@ Primary references:
   - your strategy returns order intents instead of calling exchange plumbing directly
   - supports Spot and Futures with the same runner
   - includes 21 built-in strategies out of the box
+- Runtime infra:
+  - daemon profiles in TOML or JSON
+  - supervised always-on execution with restart backoff
+  - startup reconcile plus periodic reconcile for live credentials
+  - SQLite-backed runtime status and heartbeat snapshots
+  - daemon status and healthcheck commands for Docker or ops
 - CLI for:
   - health checks
   - account inspection
@@ -104,12 +110,21 @@ BINANCE_PRIVATE_KEY_PATH=/absolute/path/to/private-key.pem
 BINANCE_PRIVATE_KEY_PASSPHRASE=
 ```
 
-### 3. Start with testnet
+### 3. Start with the right environment
 
 ```bash
 BINANCE_ENV=testnet
 DRY_RUN=true
 ```
+
+If your server or local IP gets Binance `451 restricted location` responses on `binance.com` or `testnet.binance.vision`, and you are trading through Binance.US, switch to:
+
+```bash
+BINANCE_ENV=binance_us
+DRY_RUN=true
+```
+
+`binance_us` is Spot-only in this project. USDⓈ-M Futures still require `BINANCE_ENV=mainnet` or `BINANCE_ENV=testnet` on Binance.com-compatible infrastructure.
 
 ### 4. Run health check
 
@@ -153,7 +168,40 @@ Your strategy should return one of:
 
 See [examples/strategies/spot_mean_reversion.py](/Users/zhaoyue/Documents/Works/Playground/BinanceTrade/examples/strategies/spot_mean_reversion.py:1) for the template.
 
-### 6. Use built-in strategies
+### 6. Run a production daemon profile
+
+Built-in strategies are research templates. They intentionally stop after the first signal, so they are not the 24/7 production path.
+
+The production path in this repo is:
+
+1. write a persistent strategy that does not return `StopStrategy`
+2. wrap it in a runtime profile
+3. run it under the supervised daemon
+
+The included reference pair is:
+
+- strategy: [spot_ema_persistent.py](/Users/zhaoyue/Documents/Works/Playground/BinanceTrade/examples/strategies/spot_ema_persistent.py:1)
+- profile: [spot_ema_btcusdt.toml](/Users/zhaoyue/Documents/Works/Playground/BinanceTrade/examples/runtime/spot_ema_btcusdt.toml:1)
+
+Validate and run it:
+
+```bash
+binance-trade show-runtime-profile examples/runtime/spot_ema_btcusdt.toml
+binance-trade doctor-runtime-profile examples/runtime/spot_ema_btcusdt.toml
+binance-trade run-daemon examples/runtime/spot_ema_btcusdt.toml
+```
+
+Inspect daemon health:
+
+```bash
+binance-trade daemon-status
+binance-trade daemon-status spot-ema-btcusdt
+binance-trade daemon-health spot-ema-btcusdt
+```
+
+The operational model is documented in [runtime_operations.md](/Users/zhaoyue/Documents/Works/Playground/BinanceTrade/docs/runtime_operations.md:1).
+
+### 7. Use built-in strategies
 
 The repo now includes 21 built-in strategy templates. See the full catalog in [strategy_catalog.md](/Users/zhaoyue/Documents/Works/Playground/BinanceTrade/docs/strategy_catalog.md:1).
 
@@ -161,6 +209,12 @@ List them:
 
 ```bash
 binance-trade list-strategies
+```
+
+Research presets:
+
+```bash
+binance-trade list-presets
 ```
 
 Run one on Spot:
@@ -301,6 +355,83 @@ binance-trade run-builtin-strategy ichimoku_trend \
   --params-json '{"symbol":"BTCUSDT","interval":"15m","quantity":"0.001","trade_side":"both"}'
 ```
 
+### 8. Research before execution
+
+The project now includes a research-grade backtest layer with explicit assumptions:
+
+- signal is evaluated on the closed candle
+- execution is modeled on the next candle open
+- fee and slippage are applied per side
+- Spot is modeled as long-only inventory
+- Futures are modeled as directional exposure without funding or liquidation
+
+Backtest a preset:
+
+```bash
+binance-trade backtest-preset binance_us_spot_ema_btc_15m
+```
+
+Backtest any built-in strategy directly:
+
+```bash
+binance-trade backtest-builtin-strategy ema_crossover \
+  --market spot \
+  --bars 2000 \
+  --fee-bps 10 \
+  --slippage-bps 3 \
+  --params-json '{"symbol":"BTCUSDT","interval":"15m","fast_period":12,"slow_period":26,"trade_side":"long"}'
+```
+
+See the full workflow in [research_workflow.md](/Users/zhaoyue/Documents/Works/Playground/BinanceTrade/docs/research_workflow.md:1).
+
+Benchmark every built-in strategy on one common market, symbol, and interval, then generate JSON, SVG charts, and an HTML report:
+
+```bash
+BINANCE_ENV=binance_us binance-trade benchmark-builtin-strategies \
+  --market spot \
+  --symbol BTCUSDT \
+  --interval 15m \
+  --bars 1500
+```
+
+The command writes:
+
+- `benchmark_results.json`
+- `summary_returns.svg`
+- `risk_return.svg`
+- `equity_curves/*.svg`
+- `report.html`
+
+You can speed up broad universe scans with multiple workers:
+
+```bash
+BINANCE_ENV=binance_us binance-trade benchmark-builtin-strategies \
+  --market spot \
+  --symbol BTCUSDT \
+  --interval 15m \
+  --bars 1500 \
+  --workers 6
+```
+
+Run walk-forward analysis on a built-in strategy:
+
+```bash
+BINANCE_ENV=binance_us binance-trade walkforward-builtin-strategy ema_crossover \
+  --market spot \
+  --bars 2000 \
+  --train-bars 1000 \
+  --test-bars 250 \
+  --params-json '{"symbol":"BTCUSDT","interval":"15m","fast_period":12,"slow_period":26,"trade_side":"long"}'
+```
+
+Or on a preset:
+
+```bash
+BINANCE_ENV=binance_us binance-trade walkforward-preset binance_us_spot_ema_btc_15m \
+  --train-bars 1000 \
+  --test-bars 250
+```
+
 ## How To Fill `.env`
 
 Use plain `KEY=value` lines.
@@ -324,6 +455,7 @@ FUTURES_DEFAULT_SYMBOL=BTCUSDT
 DRY_RUN=true
 LOG_LEVEL=INFO
 STATE_DB_PATH=var/state.db
+RUNTIME_DIR=var/runtime
 
 MAX_ORDER_NOTIONAL=50
 MAX_OPEN_ORDERS_PER_SYMBOL=5
@@ -335,6 +467,28 @@ FUTURES_MAX_OPEN_ORDERS_PER_SYMBOL=5
 FUTURES_ORDER_COOLDOWN_SECONDS=5
 FUTURES_ALLOWED_SYMBOLS=BTCUSDT,ETHUSDT
 
+REQUEST_TIMEOUT_SECONDS=10
+RECV_WINDOW_MS=5000
+DAEMON_HEARTBEAT_INTERVAL_SECONDS=30
+DAEMON_RECONCILE_INTERVAL_SECONDS=300
+DAEMON_RESTART_DELAY_SECONDS=5
+DAEMON_MAX_RESTART_DELAY_SECONDS=60
+DAEMON_STALE_AFTER_SECONDS=90
+```
+
+### Binance.US Spot example
+
+```bash
+BINANCE_ENV=binance_us
+BINANCE_API_KEY=your_binance_us_key
+BINANCE_API_SECRET=your_binance_us_secret
+BINANCE_API_KEY_TYPE=HMAC
+
+DEFAULT_SYMBOL=BTCUSDT
+DRY_RUN=true
+ALLOWED_SYMBOLS=BTCUSDT,ETHUSDT,BTCUSD,ETHUSD
+STATE_DB_PATH=var/state.db
+RUNTIME_DIR=var/runtime
 REQUEST_TIMEOUT_SECONDS=10
 RECV_WINDOW_MS=5000
 ```
@@ -362,7 +516,7 @@ DRY_RUN=true
 
 ### What each key means
 
-- `BINANCE_ENV`: `testnet` or `mainnet`
+- `BINANCE_ENV`: `testnet`, `mainnet`, or `binance_us`
 - `BINANCE_API_KEY`: your Binance API key
 - `BINANCE_API_SECRET`: only for `HMAC`
 - `BINANCE_API_KEY_TYPE`: `HMAC`, `RSA`, or `ED25519`
@@ -374,28 +528,49 @@ DRY_RUN=true
 - `FUTURES_MAX_ORDER_NOTIONAL`: local Futures cap in quote currency estimation
 - `ALLOWED_SYMBOLS` and `FUTURES_ALLOWED_SYMBOLS`: local allow-lists
 - `STATE_DB_PATH`: SQLite file for orders and events
+- `RUNTIME_DIR`: JSON heartbeat directory for daemon status files
+- `DAEMON_*`: default heartbeat, reconcile, restart, and stale thresholds for daemon profiles
 - `RECV_WINDOW_MS`: Binance signed request receive window
+
+### `451 restricted location` means
+
+If you see a response like:
+
+```text
+Service unavailable from a restricted location according to 'b. Eligibility'
+```
+
+that is an exchange-side geo-eligibility block, not a bug in your strategy code.
+
+- For Binance.US accounts: set `BINANCE_ENV=binance_us`.
+- For Binance.com Spot/Testnet: run the bot from a Binance.com-supported jurisdiction/IP.
+- For USDⓈ-M Futures: this project assumes Binance.com futures endpoints; `binance_us` does not unlock futures here.
 
 ### Recommended progression
 
 1. Start with `BINANCE_ENV=testnet` and `DRY_RUN=true`.
 2. Confirm `binance-trade doctor`, `futures-doctor`, `watch-user`, and `futures-watch-user` all work.
 3. Keep `DRY_RUN=true` while testing strategies with `run-builtin-strategy` or `run-strategy`.
-4. Switch to `--test-order` where available.
-5. Move to mainnet with `DRY_RUN=true`.
-6. Only then use `--live` with very small size.
+4. Promote your chosen strategy into a runtime profile and validate it with `doctor-runtime-profile`.
+5. Run the profile under `run-daemon` in `DRY_RUN=true`.
+6. Switch to `--test-order` where available.
+7. Move to mainnet with `DRY_RUN=true`.
+8. Only then use `--live` with very small size.
 
 ## Safety Notes
 
 - Keep `DRY_RUN=true` until `doctor`, `account`, and `watch-user` all work as expected.
 - Do not grant withdrawal permissions to the bot key.
 - Prefer a sub-account and fixed IP whitelist before switching to mainnet.
+- Treat built-in strategies as research surfaces. For 24/7 execution, use a persistent custom strategy plus a runtime profile.
 - `buy-market` accepts quote notional. `sell-market` uses base quantity to avoid ambiguous quote sizing.
 - Futures market orders use base quantity, not quote notional.
 - Futures defaults are intentionally conservative. `FUTURES_MAX_ORDER_NOTIONAL=50` will reject larger demo orders locally before they hit Binance.
 - Futures `reduceOnly` orders are allowed through local risk caps so you can still shrink exposure under stress.
 - Binance still makes the final filter decision. This project pre-validates the common filters locally to reduce preventable rejects.
 - This starter currently focuses on Spot plus USDⓈ-M Futures market/limit execution. More advanced futures order types from Binance docs are not wired into the CLI yet.
+- Research backtests model next-bar execution with fee and slippage, but they still do not include funding, liquidation, borrow cost, partial fills, or latency spikes.
+- The daemon keeps runtime status in SQLite and mirrored JSON files under `RUNTIME_DIR`. Those files are what `daemon-health` checks in containerized deployments.
 
 ## Architecture
 
@@ -408,6 +583,8 @@ binance_trade/
   filters.py        exchangeInfo parsing and validation
   risk.py           local guard rails
   state.py          SQLite order and event journal
+  daemon.py         supervised runtime and heartbeat snapshots
+  runtime_profiles.py runtime profile loader
   ws_market.py      public market streams
   ws_user.py        private user stream over WebSocket API
   futures_ws_user.py futures listenKey stream handling
@@ -425,15 +602,31 @@ Build:
 docker build -t binance-trade .
 ```
 
-Run:
+Validate the profile locally:
 
 ```bash
-docker run --rm --env-file .env -v "$(pwd)/var:/app/var" binance-trade binance-trade doctor
+docker run --rm --env-file .env -v "$(pwd)/var:/app/var" -v "$(pwd)/examples:/app/examples:ro" \
+  binance-trade binance-trade doctor-runtime-profile examples/runtime/spot_ema_btcusdt.toml
+```
+
+Run the supervised daemon:
+
+```bash
+docker run -d --name binance-trader --restart unless-stopped \
+  --env-file .env \
+  -v "$(pwd)/var:/app/var" \
+  -v "$(pwd)/examples:/app/examples:ro" \
+  binance-trade binance-trade run-daemon examples/runtime/spot_ema_btcusdt.toml
+```
+
+Or use Compose:
+
+```bash
+docker compose up -d --build
 ```
 
 ## Next Extensions
 
-- persistent reconciliation on startup against open orders, balances, and futures positions
 - more futures order types: `STOP_MARKET`, `TAKE_PROFIT_MARKET`, trailing stop, and GTD helpers
 - separate trade and user-data API keys
 - metrics, alerts, and process supervision

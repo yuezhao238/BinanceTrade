@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import sqlite3
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -51,6 +53,42 @@ class SQLiteStateStore:
                     payload_json TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS runtime_sessions (
+                    run_id TEXT PRIMARY KEY,
+                    service_name TEXT NOT NULL,
+                    market_type TEXT NOT NULL,
+                    strategy_ref TEXT NOT NULL,
+                    submission_mode TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    restart_count INTEGER NOT NULL DEFAULT 0,
+                    profile_json TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    last_heartbeat_at TEXT,
+                    stopped_at TEXT,
+                    reason TEXT,
+                    error_text TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS runtime_status (
+                    service_name TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    market_type TEXT NOT NULL,
+                    strategy_ref TEXT NOT NULL,
+                    submission_mode TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    restart_count INTEGER NOT NULL DEFAULT 0,
+                    stale_after_seconds INTEGER NOT NULL DEFAULT 90,
+                    summary_json TEXT NOT NULL,
+                    ctx_state_json TEXT,
+                    strategy_state_json TEXT,
+                    started_at TEXT NOT NULL,
+                    last_heartbeat_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_runtime_sessions_service_name ON runtime_sessions(service_name);
+                CREATE INDEX IF NOT EXISTS idx_runtime_sessions_started_at ON runtime_sessions(started_at);
                 """
             )
             self._ensure_column(connection, "orders", "market_type", "TEXT NOT NULL DEFAULT 'spot'")
@@ -227,3 +265,230 @@ class SQLiteStateStore:
                 (symbol, market_type.value),
             ).fetchone()
         return None if row is None else str(row["updated_at"])
+
+    def start_runtime_session(
+        self,
+        *,
+        service_name: str,
+        market_type: MarketType,
+        strategy_ref: str,
+        submission_mode: SubmissionMode,
+        profile: dict[str, Any],
+        restart_count: int,
+        stale_after_seconds: int,
+    ) -> str:
+        run_id = uuid.uuid4().hex
+        now = utc_now_iso()
+        profile_json = json_dumps(profile)
+        empty_summary = json_dumps({"status": "STARTING"})
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO runtime_sessions (
+                    run_id, service_name, market_type, strategy_ref, submission_mode, status,
+                    restart_count, profile_json, started_at, last_heartbeat_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    service_name,
+                    market_type.value,
+                    strategy_ref,
+                    submission_mode.value,
+                    "STARTING",
+                    restart_count,
+                    profile_json,
+                    now,
+                    now,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO runtime_status (
+                    service_name, run_id, market_type, strategy_ref, submission_mode, status,
+                    restart_count, stale_after_seconds, summary_json, ctx_state_json,
+                    strategy_state_json, started_at, last_heartbeat_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(service_name) DO UPDATE SET
+                    run_id=excluded.run_id,
+                    market_type=excluded.market_type,
+                    strategy_ref=excluded.strategy_ref,
+                    submission_mode=excluded.submission_mode,
+                    status=excluded.status,
+                    restart_count=excluded.restart_count,
+                    stale_after_seconds=excluded.stale_after_seconds,
+                    summary_json=excluded.summary_json,
+                    ctx_state_json=excluded.ctx_state_json,
+                    strategy_state_json=excluded.strategy_state_json,
+                    started_at=excluded.started_at,
+                    last_heartbeat_at=excluded.last_heartbeat_at,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    service_name,
+                    run_id,
+                    market_type.value,
+                    strategy_ref,
+                    submission_mode.value,
+                    "STARTING",
+                    restart_count,
+                    stale_after_seconds,
+                    empty_summary,
+                    None,
+                    None,
+                    now,
+                    now,
+                    now,
+                ),
+            )
+        return run_id
+
+    def update_runtime_status(
+        self,
+        *,
+        service_name: str,
+        run_id: str,
+        market_type: MarketType,
+        strategy_ref: str,
+        submission_mode: SubmissionMode,
+        status: str,
+        restart_count: int,
+        stale_after_seconds: int,
+        summary: dict[str, Any],
+        ctx_state: dict[str, Any] | None = None,
+        strategy_state: dict[str, Any] | None = None,
+    ) -> None:
+        now = utc_now_iso()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE runtime_sessions
+                SET status = ?, restart_count = ?, last_heartbeat_at = ?
+                WHERE run_id = ?
+                """,
+                (status, restart_count, now, run_id),
+            )
+            connection.execute(
+                """
+                INSERT INTO runtime_status (
+                    service_name, run_id, market_type, strategy_ref, submission_mode, status,
+                    restart_count, stale_after_seconds, summary_json, ctx_state_json,
+                    strategy_state_json, started_at, last_heartbeat_at, updated_at
+                )
+                VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    COALESCE((SELECT started_at FROM runtime_status WHERE service_name = ?), ?),
+                    ?, ?
+                )
+                ON CONFLICT(service_name) DO UPDATE SET
+                    run_id=excluded.run_id,
+                    market_type=excluded.market_type,
+                    strategy_ref=excluded.strategy_ref,
+                    submission_mode=excluded.submission_mode,
+                    status=excluded.status,
+                    restart_count=excluded.restart_count,
+                    stale_after_seconds=excluded.stale_after_seconds,
+                    summary_json=excluded.summary_json,
+                    ctx_state_json=excluded.ctx_state_json,
+                    strategy_state_json=excluded.strategy_state_json,
+                    last_heartbeat_at=excluded.last_heartbeat_at,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    service_name,
+                    run_id,
+                    market_type.value,
+                    strategy_ref,
+                    submission_mode.value,
+                    status,
+                    restart_count,
+                    stale_after_seconds,
+                    json_dumps(summary),
+                    None if ctx_state is None else json_dumps(ctx_state),
+                    None if strategy_state is None else json_dumps(strategy_state),
+                    service_name,
+                    now,
+                    now,
+                    now,
+                ),
+            )
+
+    def stop_runtime_session(
+        self,
+        *,
+        run_id: str,
+        service_name: str,
+        status: str,
+        reason: str | None = None,
+        error_text: str | None = None,
+        summary: dict[str, Any] | None = None,
+    ) -> None:
+        now = utc_now_iso()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE runtime_sessions
+                SET status = ?, stopped_at = ?, reason = ?, error_text = ?, last_heartbeat_at = ?
+                WHERE run_id = ?
+                """,
+                (status, now, reason, error_text, now, run_id),
+            )
+            if summary is not None:
+                connection.execute(
+                    """
+                    UPDATE runtime_status
+                    SET status = ?, summary_json = ?, last_heartbeat_at = ?, updated_at = ?
+                    WHERE service_name = ? AND run_id = ?
+                    """,
+                    (status, json_dumps(summary), now, now, service_name, run_id),
+                )
+
+    def get_runtime_status(self, service_name: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT *
+                FROM runtime_status
+                WHERE service_name = ?
+                """,
+                (service_name,),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._runtime_status_row_to_dict(row)
+
+    def list_runtime_statuses(self) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM runtime_status
+                ORDER BY updated_at DESC, service_name ASC
+                """
+            ).fetchall()
+        return [self._runtime_status_row_to_dict(row) for row in rows]
+
+    def _runtime_status_row_to_dict(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "service_name": str(row["service_name"]),
+            "run_id": str(row["run_id"]),
+            "market_type": str(row["market_type"]),
+            "strategy_ref": str(row["strategy_ref"]),
+            "submission_mode": str(row["submission_mode"]),
+            "status": str(row["status"]),
+            "restart_count": int(row["restart_count"]),
+            "stale_after_seconds": int(row["stale_after_seconds"]),
+            "summary": self._loads_json(row["summary_json"]),
+            "ctx_state": self._loads_json(row["ctx_state_json"]),
+            "strategy_state": self._loads_json(row["strategy_state_json"]),
+            "started_at": str(row["started_at"]),
+            "last_heartbeat_at": str(row["last_heartbeat_at"]),
+            "updated_at": str(row["updated_at"]),
+        }
+
+    def _loads_json(self, payload: Any) -> Any:
+        if payload in (None, ""):
+            return None
+        if isinstance(payload, (dict, list)):
+            return payload
+        return json.loads(str(payload))

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from decimal import Decimal
 from typing import Any
@@ -7,7 +8,7 @@ from typing import Any
 import httpx
 
 from .config import Settings
-from .exceptions import BinanceAPIError, BinanceExecutionUnknown, ConfigError
+from .exceptions import BinanceAPIError, BinanceExecutionUnknown, ConfigError, with_restricted_location_hint
 from .filters import SymbolRules, parse_symbol_rules
 from .signing import Authenticator
 from .types import MarketType, OrderRequest
@@ -39,8 +40,16 @@ class BinanceFuturesRestClient:
         await self._client.aclose()
 
     async def _request_public(self, method: str, path: str, *, params: dict[str, Any] | None = None) -> Any:
-        response = await self._client.request(method.upper(), path, params=params)
-        return self._handle_response(response)
+        attempts = 3
+        for attempt in range(1, attempts + 1):
+            try:
+                response = await self._client.request(method.upper(), path, params=params)
+                return self._handle_response(response)
+            except httpx.TransportError:
+                if attempt >= attempts:
+                    raise
+                await asyncio.sleep(0.5 * attempt)
+        raise RuntimeError("unreachable")
 
     async def _request_signed(self, method: str, path: str, *, params: dict[str, Any] | None = None) -> Any:
         if not self.authenticator:
@@ -86,6 +95,12 @@ class BinanceFuturesRestClient:
         message = payload.get("msg") if isinstance(payload, dict) else str(payload)
         error_cls: type[BinanceAPIError] = BinanceAPIError
         lowered = str(message).lower()
+        if response.status_code == 451 or "restricted location" in lowered or "eligibility" in lowered:
+            message = with_restricted_location_hint(
+                str(message),
+                environment=self.settings.binance_env.value,
+                market_type=MarketType.FUTURES.value,
+            )
         if code == -1007 or "status unknown" in lowered or "execution status unknown" in lowered or "unknown error" in lowered:
             error_cls = BinanceExecutionUnknown
 
@@ -132,10 +147,26 @@ class BinanceFuturesRestClient:
         return Decimal(str(payload["price"]))
 
     async def get_klines(self, symbol: str, interval: str, *, limit: int = 500) -> list[dict[str, Any]]:
+        return await self.get_klines_window(symbol, interval, limit=limit)
+
+    async def get_klines_window(
+        self,
+        symbol: str,
+        interval: str,
+        *,
+        limit: int = 500,
+        start_time: int | None = None,
+        end_time: int | None = None,
+    ) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {"symbol": symbol.upper(), "interval": interval, "limit": limit}
+        if start_time is not None:
+            params["startTime"] = start_time
+        if end_time is not None:
+            params["endTime"] = end_time
         payload = await self._request_public(
             "GET",
             "/fapi/v1/klines",
-            params={"symbol": symbol.upper(), "interval": interval, "limit": limit},
+            params=params,
         )
         return [
             {

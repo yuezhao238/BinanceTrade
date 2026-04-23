@@ -6,7 +6,7 @@ from decimal import Decimal
 from typing import Any
 
 from .config import Settings
-from .exceptions import BinanceExecutionUnknown, ConfigError, RiskRejected
+from .exceptions import BinanceExecutionUnknown, BinanceTradeError, ConfigError, RiskRejected
 from .filters import SymbolRules
 from .futures_rest import BinanceFuturesRestClient
 from .futures_ws_user import FuturesUserDataStreamClient
@@ -97,19 +97,23 @@ class SpotTradingService:
             "symbol_rules": rules.summary(),
         }
         if self.authenticator:
-            account = await self.rest.get_account()
-            balances = []
-            for balance in account.get("balances", []):
-                free = Decimal(str(balance["free"]))
-                locked = Decimal(str(balance["locked"]))
-                if free > 0 or locked > 0:
-                    balances.append(balance)
-            payload["account"] = {
-                "canTrade": account.get("canTrade"),
-                "canWithdraw": account.get("canWithdraw"),
-                "canDeposit": account.get("canDeposit"),
-                "balances": balances[:20],
-            }
+            try:
+                account = await self.rest.get_account()
+            except BinanceTradeError as exc:
+                payload["account_error"] = str(exc)
+            else:
+                balances = []
+                for balance in account.get("balances", []):
+                    free = Decimal(str(balance["free"]))
+                    locked = Decimal(str(balance["locked"]))
+                    if free > 0 or locked > 0:
+                        balances.append(balance)
+                payload["account"] = {
+                    "canTrade": account.get("canTrade"),
+                    "canWithdraw": account.get("canWithdraw"),
+                    "canDeposit": account.get("canDeposit"),
+                    "balances": balances[:20],
+                }
         return payload
 
     async def price(self, symbol: str) -> dict[str, Any]:
@@ -121,8 +125,16 @@ class SpotTradingService:
             raise ConfigError("API credentials are required for account queries")
         return await self.rest.get_account()
 
-    async def get_klines(self, symbol: str, interval: str, *, limit: int = 500) -> list[dict[str, Any]]:
-        return await self.rest.get_klines(symbol, interval, limit=limit)
+    async def get_klines(
+        self,
+        symbol: str,
+        interval: str,
+        *,
+        limit: int = 500,
+        start_time: int | None = None,
+        end_time: int | None = None,
+    ) -> list[dict[str, Any]]:
+        return await self.rest.get_klines_window(symbol, interval, limit=limit, start_time=start_time, end_time=end_time)
 
     async def _prepare_order(self, order: OrderRequest) -> tuple[OrderRequest, SymbolRules, Decimal | None]:
         order = order.normalized()
@@ -317,6 +329,7 @@ class FuturesTradingService:
     market_type = MarketType.FUTURES
 
     def __init__(self, settings: Settings) -> None:
+        settings.assert_futures_supported()
         self.settings = settings
         self.authenticator = _build_authenticator(settings)
         self.state = SQLiteStateStore(settings.state_db_path)
@@ -378,15 +391,19 @@ class FuturesTradingService:
             "symbol_rules": rules.summary(),
         }
         if self.authenticator:
-            account = await self.rest.get_account()
-            positions = [item for item in account.get("positions", []) if Decimal(str(item.get("positionAmt", "0"))) != 0]
-            assets = [item for item in account.get("assets", []) if Decimal(str(item.get("walletBalance", "0"))) != 0]
-            payload["account"] = {
-                "availableBalance": account.get("availableBalance"),
-                "totalMarginBalance": account.get("totalMarginBalance"),
-                "assets": assets[:20],
-                "positions": positions[:20],
-            }
+            try:
+                account = await self.rest.get_account()
+            except BinanceTradeError as exc:
+                payload["account_error"] = str(exc)
+            else:
+                positions = [item for item in account.get("positions", []) if Decimal(str(item.get("positionAmt", "0"))) != 0]
+                assets = [item for item in account.get("assets", []) if Decimal(str(item.get("walletBalance", "0"))) != 0]
+                payload["account"] = {
+                    "availableBalance": account.get("availableBalance"),
+                    "totalMarginBalance": account.get("totalMarginBalance"),
+                    "assets": assets[:20],
+                    "positions": positions[:20],
+                }
         return payload
 
     async def price(self, symbol: str) -> dict[str, Any]:
@@ -398,8 +415,16 @@ class FuturesTradingService:
             raise ConfigError("API credentials are required for account queries")
         return await self.rest.get_account()
 
-    async def get_klines(self, symbol: str, interval: str, *, limit: int = 500) -> list[dict[str, Any]]:
-        return await self.rest.get_klines(symbol, interval, limit=limit)
+    async def get_klines(
+        self,
+        symbol: str,
+        interval: str,
+        *,
+        limit: int = 500,
+        start_time: int | None = None,
+        end_time: int | None = None,
+    ) -> list[dict[str, Any]]:
+        return await self.rest.get_klines_window(symbol, interval, limit=limit, start_time=start_time, end_time=end_time)
 
     async def positions(self, symbol: str | None = None) -> dict[str, Any]:
         if not self.authenticator:

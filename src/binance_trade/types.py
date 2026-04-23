@@ -11,6 +11,7 @@ from .utils import decimal_to_str
 class Environment(str, Enum):
     TESTNET = "testnet"
     MAINNET = "mainnet"
+    BINANCE_US = "binance_us"
 
 
 class ApiKeyType(str, Enum):

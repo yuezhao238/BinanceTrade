@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import datetime
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 
 import typer
@@ -10,11 +12,17 @@ import typer
 from .builtin_strategies import create_strategy as create_builtin_strategy
 from .builtin_strategies import list_strategies as list_builtin_strategies
 from .config import get_settings
+from .daemon import StrategyDaemon, is_runtime_status_healthy
 from .exceptions import BinanceTradeError
 from .logging_utils import setup_logging
+from .presets import get_preset, list_presets as list_research_presets
+from .research import BacktestConfig, benchmark_builtin_strategies, fetch_recent_candles, run_backtest, run_walkforward_analysis
+from .research_report import write_benchmark_report, write_walkforward_report
+from .runtime_profiles import RuntimeProfile, load_runtime_profile
 from .service import FuturesTradingService, SpotTradingService
+from .state import SQLiteStateStore
 from .strategy_runtime import StrategyRunner, load_strategy, parse_strategy_params
-from .types import PositionSide, SubmissionMode
+from .types import MarketType, PositionSide, SubmissionMode
 
 app = typer.Typer(no_args_is_help=True, help="Professional Binance Spot and USDⓈ-M Futures trading starter.")
 
@@ -47,6 +55,16 @@ def _decimal(value: str) -> Decimal:
     return Decimal(value)
 
 
+def _float_decimal(value: str) -> float:
+    return float(Decimal(value))
+
+
+def _csv_list(value: str | None) -> list[str] | None:
+    if value is None or not value.strip():
+        return None
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
 def _resolve_mode(live: bool, test_order: bool) -> SubmissionMode | None:
     if live and test_order:
         raise ValueError("--live and --test-order are mutually exclusive")
@@ -71,6 +89,90 @@ async def _with_spot_service(callback: Any) -> Any:
 async def _with_futures_service(callback: Any) -> Any:
     async with FuturesTradingService(get_settings()) as service:
         return await callback(service)
+
+
+def _load_runtime_profile(path: str) -> RuntimeProfile:
+    return load_runtime_profile(Path(path))
+
+
+async def _profile_doctor(profile: RuntimeProfile, submission_mode: SubmissionMode | None) -> dict[str, Any]:
+    settings = get_settings()
+    selected_mode = profile.resolve_submission_mode(submission_mode, default_dry_run=settings.dry_run)
+    symbol = profile.params.get("symbol")
+
+    async def _spot() -> dict[str, Any]:
+        async with SpotTradingService(settings) as service:
+            payload = await service.doctor(symbol)
+            payload["runtime_profile"] = profile.to_dict()
+            payload["resolved_submission_mode"] = selected_mode.value
+            return payload
+
+    async def _futures() -> dict[str, Any]:
+        async with FuturesTradingService(settings) as service:
+            payload = await service.doctor(symbol)
+            payload["runtime_profile"] = profile.to_dict()
+            payload["resolved_submission_mode"] = selected_mode.value
+            return payload
+
+    if profile.market is MarketType.SPOT:
+        return await _spot()
+    return await _futures()
+
+
+async def _run_daemon_profile(profile: RuntimeProfile, submission_mode: SubmissionMode | None) -> dict[str, Any]:
+    settings = get_settings()
+    selected_mode = profile.resolve_submission_mode(submission_mode, default_dry_run=settings.dry_run)
+    store = SQLiteStateStore(settings.state_db_path)
+
+    async def _spot() -> dict[str, Any]:
+        daemon = StrategyDaemon(
+            settings=settings,
+            profile=profile,
+            state_store=store,
+            service_factory=lambda: SpotTradingService(settings),
+        )
+        return await daemon.run()
+
+    async def _futures() -> dict[str, Any]:
+        daemon = StrategyDaemon(
+            settings=settings,
+            profile=profile,
+            state_store=store,
+            service_factory=lambda: FuturesTradingService(settings),
+        )
+        return await daemon.run()
+
+    if selected_mode != profile.resolve_submission_mode(None, default_dry_run=settings.dry_run):
+        profile = RuntimeProfile(
+            name=profile.name,
+            market=profile.market,
+            strategy_ref=profile.strategy_ref,
+            params=profile.params,
+            submission_mode=selected_mode,
+            description=profile.description,
+            notes=profile.notes,
+            daemon=profile.daemon,
+            path=profile.path,
+        )
+
+    if profile.market is MarketType.SPOT:
+        return await _spot()
+    return await _futures()
+
+
+def _runtime_status_payload(service_name: str | None = None) -> dict[str, Any]:
+    settings = get_settings()
+    store = SQLiteStateStore(settings.state_db_path)
+    if service_name:
+        payload = store.get_runtime_status(service_name)
+        if payload is None:
+            raise ValueError(f"runtime service {service_name!r} was not found")
+        payload["healthy"] = is_runtime_status_healthy(payload)
+        return payload
+    statuses = store.list_runtime_statuses()
+    for item in statuses:
+        item["healthy"] = is_runtime_status_healthy(item)
+    return {"services": statuses}
 
 
 @app.command("doctor")
@@ -243,6 +345,55 @@ def list_strategies() -> None:
     _print_json({"builtin_strategies": list_builtin_strategies()})
 
 
+@app.command("list-presets")
+def list_presets() -> None:
+    _print_json({"presets": list_research_presets()})
+
+
+@app.command("show-runtime-profile")
+def show_runtime_profile(path: str = typer.Argument(..., help="Path to a runtime profile TOML or JSON file.")) -> None:
+    profile = _load_runtime_profile(path)
+    _print_json({"runtime_profile": profile.to_dict()})
+
+
+@app.command("doctor-runtime-profile")
+def doctor_runtime_profile(
+    path: str = typer.Argument(..., help="Path to a runtime profile TOML or JSON file."),
+    live: bool = typer.Option(False, "--live", help="Resolve this profile in live mode."),
+    test_order: bool = typer.Option(False, "--test-order", help="Resolve this profile in exchange test mode."),
+) -> None:
+    profile = _load_runtime_profile(path)
+    _run(_profile_doctor(profile, _resolve_mode(live, test_order)))
+
+
+@app.command("run-daemon")
+def run_daemon(
+    path: str = typer.Argument(..., help="Path to a runtime profile TOML or JSON file."),
+    live: bool = typer.Option(False, "--live", help="Force live submission mode."),
+    test_order: bool = typer.Option(False, "--test-order", help="Force exchange test submission mode."),
+) -> None:
+    profile = _load_runtime_profile(path)
+    _run(_run_daemon_profile(profile, _resolve_mode(live, test_order)))
+
+
+@app.command("daemon-status")
+def daemon_status(
+    service_name: str | None = typer.Argument(None, help="Optional runtime service name. Omit to list all tracked services."),
+) -> None:
+    _print_json(_runtime_status_payload(service_name))
+
+
+@app.command("daemon-health")
+def daemon_health(
+    service_name: str = typer.Argument(..., help="Runtime service name."),
+) -> None:
+    payload = _runtime_status_payload(service_name)
+    if not payload.get("healthy", False):
+        _print_json(payload)
+        raise typer.Exit(code=1)
+    _print_json(payload)
+
+
 @app.command("run-builtin-strategy")
 def run_builtin_strategy(
     name: str = typer.Argument(..., help="Built-in strategy name."),
@@ -279,6 +430,349 @@ def run_builtin_strategy(
         _run(_run_futures())
         return
     raise ValueError("--market must be spot or futures")
+
+
+@app.command("backtest-builtin-strategy")
+def backtest_builtin_strategy(
+    name: str = typer.Argument(..., help="Built-in strategy name."),
+    market: str = typer.Option("spot", "--market", help="spot or futures."),
+    params_json: str = typer.Option("{}", "--params-json", help="JSON object passed to the strategy constructor."),
+    bars: int = typer.Option(1500, "--bars", min=100, help="Number of recent klines to load."),
+    capital: str = typer.Option("10000", "--capital", help="Initial research capital."),
+    fee_bps: float = typer.Option(10.0, "--fee-bps", help="Round-trip modeling fee per side in basis points."),
+    slippage_bps: float = typer.Option(2.0, "--slippage-bps", help="Execution slippage per side in basis points."),
+    leverage: float = typer.Option(1.0, "--leverage", help="Research leverage assumption, mainly for futures."),
+    position_fraction: float = typer.Option(1.0, "--position-fraction", min=0.01, max=1.0, help="Fraction of equity deployed per trade."),
+) -> None:
+    params = parse_strategy_params(params_json)
+
+    async def _run_spot() -> dict[str, Any]:
+        async with SpotTradingService(get_settings()) as service:
+            strategy = create_builtin_strategy(name=name, **params)
+            candles = await fetch_recent_candles(service, strategy.symbol, strategy.interval, bars=bars)
+            return run_backtest(
+                strategy,
+                candles,
+                BacktestConfig(
+                    market_type=MarketType.SPOT,
+                    initial_capital=_float_decimal(capital),
+                    fee_bps=fee_bps,
+                    slippage_bps=slippage_bps,
+                    leverage=1.0,
+                    position_fraction=position_fraction,
+                ),
+            )
+
+    async def _run_futures() -> dict[str, Any]:
+        async with FuturesTradingService(get_settings()) as service:
+            strategy = create_builtin_strategy(name=name, **params)
+            candles = await fetch_recent_candles(service, strategy.symbol, strategy.interval, bars=bars)
+            return run_backtest(
+                strategy,
+                candles,
+                BacktestConfig(
+                    market_type=MarketType.FUTURES,
+                    initial_capital=_float_decimal(capital),
+                    fee_bps=fee_bps,
+                    slippage_bps=slippage_bps,
+                    leverage=leverage,
+                    position_fraction=position_fraction,
+                ),
+            )
+
+    if market.lower() == "spot":
+        _run(_run_spot())
+        return
+    if market.lower() == "futures":
+        _run(_run_futures())
+        return
+    raise ValueError("--market must be spot or futures")
+
+
+@app.command("backtest-preset")
+def backtest_preset(
+    name: str = typer.Argument(..., help="Research preset name."),
+    bars: int | None = typer.Option(None, "--bars", min=100, help="Override the preset history size."),
+    capital: str = typer.Option("10000", "--capital", help="Initial research capital."),
+    fee_bps: float | None = typer.Option(None, "--fee-bps", help="Override preset fee assumption."),
+    slippage_bps: float | None = typer.Option(None, "--slippage-bps", help="Override preset slippage assumption."),
+    leverage: float | None = typer.Option(None, "--leverage", help="Override preset leverage assumption."),
+    position_fraction: float | None = typer.Option(None, "--position-fraction", min=0.01, max=1.0, help="Override preset position fraction."),
+) -> None:
+    preset = get_preset(name)
+    chosen_bars = bars or preset.research_bars
+    chosen_fee_bps = preset.fee_bps if fee_bps is None else fee_bps
+    chosen_slippage_bps = preset.slippage_bps if slippage_bps is None else slippage_bps
+    chosen_leverage = preset.leverage if leverage is None else leverage
+    chosen_position_fraction = preset.position_fraction if position_fraction is None else position_fraction
+
+    async def _run_spot() -> dict[str, Any]:
+        async with SpotTradingService(get_settings()) as service:
+            strategy = create_builtin_strategy(name=preset.strategy_name, **preset.params)
+            candles = await fetch_recent_candles(service, strategy.symbol, strategy.interval, bars=chosen_bars)
+            result = run_backtest(
+                strategy,
+                candles,
+                BacktestConfig(
+                    market_type=MarketType.SPOT,
+                    initial_capital=_float_decimal(capital),
+                    fee_bps=chosen_fee_bps,
+                    slippage_bps=chosen_slippage_bps,
+                    leverage=1.0,
+                    position_fraction=chosen_position_fraction,
+                ),
+            )
+            result["preset"] = name
+            result["preset_notes"] = list(preset.notes)
+            return result
+
+    async def _run_futures() -> dict[str, Any]:
+        async with FuturesTradingService(get_settings()) as service:
+            strategy = create_builtin_strategy(name=preset.strategy_name, **preset.params)
+            candles = await fetch_recent_candles(service, strategy.symbol, strategy.interval, bars=chosen_bars)
+            result = run_backtest(
+                strategy,
+                candles,
+                BacktestConfig(
+                    market_type=MarketType.FUTURES,
+                    initial_capital=_float_decimal(capital),
+                    fee_bps=chosen_fee_bps,
+                    slippage_bps=chosen_slippage_bps,
+                    leverage=chosen_leverage,
+                    position_fraction=chosen_position_fraction,
+                ),
+            )
+            result["preset"] = name
+            result["preset_notes"] = list(preset.notes)
+            return result
+
+    if preset.market is MarketType.SPOT:
+        _run(_run_spot())
+        return
+    _run(_run_futures())
+
+
+@app.command("benchmark-builtin-strategies")
+def benchmark_all_strategies(
+    market: str = typer.Option("spot", "--market", help="spot or futures."),
+    symbol: str = typer.Option("BTCUSDT", "--symbol", help="Benchmark symbol."),
+    interval: str = typer.Option("15m", "--interval", help="Common interval for all strategies."),
+    bars: int = typer.Option(1500, "--bars", min=200, help="Number of recent klines."),
+    capital: str = typer.Option("10000", "--capital", help="Initial research capital."),
+    fee_bps: float = typer.Option(10.0, "--fee-bps", help="Modeled fee per side in basis points."),
+    slippage_bps: float = typer.Option(2.0, "--slippage-bps", help="Modeled slippage per side in basis points."),
+    leverage: float = typer.Option(1.0, "--leverage", help="Leverage assumption, mainly for futures."),
+    position_fraction: float = typer.Option(1.0, "--position-fraction", min=0.01, max=1.0, help="Fraction of equity deployed per signal."),
+    strategies: str | None = typer.Option(None, "--strategies", help="Optional comma-separated built-in strategy names."),
+    out_dir: str | None = typer.Option(None, "--out-dir", help="Optional output directory for JSON/SVG/HTML files."),
+    workers: int | None = typer.Option(None, "--workers", min=1, help="Optional worker count for parallel backtests."),
+) -> None:
+    chosen_market = market.lower()
+    chosen_names = _csv_list(strategies)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    resolved_out_dir = Path(out_dir) if out_dir else Path("var/research_reports") / f"{chosen_market}_{symbol.upper()}_{interval}_{timestamp}"
+
+    async def _run_spot() -> dict[str, Any]:
+        async with SpotTradingService(get_settings()) as service:
+            benchmark = await benchmark_builtin_strategies(
+                service,
+                market_type=MarketType.SPOT,
+                symbol=symbol,
+                interval=interval,
+                bars=bars,
+                initial_capital=_float_decimal(capital),
+                fee_bps=fee_bps,
+                slippage_bps=slippage_bps,
+                leverage=1.0,
+                position_fraction=position_fraction,
+                strategy_names=chosen_names,
+                workers=workers,
+            )
+            artifacts = write_benchmark_report(benchmark, resolved_out_dir.resolve())
+            return {
+                "benchmark": benchmark["benchmark"],
+                "top_strategies": benchmark["top_strategies"],
+                "worst_strategies": benchmark["worst_strategies"],
+                "artifacts": artifacts,
+            }
+
+    async def _run_futures() -> dict[str, Any]:
+        async with FuturesTradingService(get_settings()) as service:
+            benchmark = await benchmark_builtin_strategies(
+                service,
+                market_type=MarketType.FUTURES,
+                symbol=symbol,
+                interval=interval,
+                bars=bars,
+                initial_capital=_float_decimal(capital),
+                fee_bps=fee_bps,
+                slippage_bps=slippage_bps,
+                leverage=leverage,
+                position_fraction=position_fraction,
+                strategy_names=chosen_names,
+                workers=workers,
+            )
+            artifacts = write_benchmark_report(benchmark, resolved_out_dir.resolve())
+            return {
+                "benchmark": benchmark["benchmark"],
+                "top_strategies": benchmark["top_strategies"],
+                "worst_strategies": benchmark["worst_strategies"],
+                "artifacts": artifacts,
+            }
+
+    if chosen_market == "spot":
+        _run(_run_spot())
+        return
+    if chosen_market == "futures":
+        _run(_run_futures())
+        return
+    raise ValueError("--market must be spot or futures")
+
+
+@app.command("walkforward-builtin-strategy")
+def walkforward_builtin_strategy(
+    name: str = typer.Argument(..., help="Built-in strategy name."),
+    market: str = typer.Option("spot", "--market", help="spot or futures."),
+    params_json: str = typer.Option("{}", "--params-json", help="JSON object passed to the strategy constructor."),
+    bars: int = typer.Option(2000, "--bars", min=300, help="Number of recent klines to load."),
+    train_bars: int = typer.Option(1000, "--train-bars", min=100, help="Number of bars in each in-sample fold."),
+    test_bars: int = typer.Option(250, "--test-bars", min=50, help="Number of bars in each out-of-sample fold."),
+    step_bars: int | None = typer.Option(None, "--step-bars", min=1, help="Fold step size; defaults to test-bars."),
+    capital: str = typer.Option("10000", "--capital", help="Initial research capital."),
+    fee_bps: float = typer.Option(10.0, "--fee-bps", help="Modeled fee per side in basis points."),
+    slippage_bps: float = typer.Option(2.0, "--slippage-bps", help="Modeled slippage per side in basis points."),
+    leverage: float = typer.Option(1.0, "--leverage", help="Leverage assumption, mainly for futures."),
+    position_fraction: float = typer.Option(1.0, "--position-fraction", min=0.01, max=1.0, help="Fraction of equity deployed per signal."),
+    out_dir: str | None = typer.Option(None, "--out-dir", help="Optional output directory for JSON/SVG/HTML files."),
+) -> None:
+    params = parse_strategy_params(params_json)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    resolved_out_dir = Path(out_dir) if out_dir else Path("var/walkforward_reports") / f"{market.lower()}_{name}_{timestamp}"
+
+    async def _run_spot() -> dict[str, Any]:
+        async with SpotTradingService(get_settings()) as service:
+            strategy = create_builtin_strategy(name=name, **params)
+            candles = await fetch_recent_candles(service, strategy.symbol, strategy.interval, bars=bars)
+            report = run_walkforward_analysis(
+                strategy,
+                candles,
+                BacktestConfig(
+                    market_type=MarketType.SPOT,
+                    initial_capital=_float_decimal(capital),
+                    fee_bps=fee_bps,
+                    slippage_bps=slippage_bps,
+                    leverage=1.0,
+                    position_fraction=position_fraction,
+                ),
+                train_bars=train_bars,
+                test_bars=test_bars,
+                step_bars=step_bars,
+            )
+            artifacts = write_walkforward_report(report, resolved_out_dir.resolve())
+            return {"summary": report["summary"], "fold_count": report["fold_count"], "artifacts": artifacts}
+
+    async def _run_futures() -> dict[str, Any]:
+        async with FuturesTradingService(get_settings()) as service:
+            strategy = create_builtin_strategy(name=name, **params)
+            candles = await fetch_recent_candles(service, strategy.symbol, strategy.interval, bars=bars)
+            report = run_walkforward_analysis(
+                strategy,
+                candles,
+                BacktestConfig(
+                    market_type=MarketType.FUTURES,
+                    initial_capital=_float_decimal(capital),
+                    fee_bps=fee_bps,
+                    slippage_bps=slippage_bps,
+                    leverage=leverage,
+                    position_fraction=position_fraction,
+                ),
+                train_bars=train_bars,
+                test_bars=test_bars,
+                step_bars=step_bars,
+            )
+            artifacts = write_walkforward_report(report, resolved_out_dir.resolve())
+            return {"summary": report["summary"], "fold_count": report["fold_count"], "artifacts": artifacts}
+
+    if market.lower() == "spot":
+        _run(_run_spot())
+        return
+    if market.lower() == "futures":
+        _run(_run_futures())
+        return
+    raise ValueError("--market must be spot or futures")
+
+
+@app.command("walkforward-preset")
+def walkforward_preset(
+    name: str = typer.Argument(..., help="Research preset name."),
+    bars: int | None = typer.Option(None, "--bars", min=300, help="Override the preset history size."),
+    train_bars: int = typer.Option(1000, "--train-bars", min=100, help="Number of bars in each in-sample fold."),
+    test_bars: int = typer.Option(250, "--test-bars", min=50, help="Number of bars in each out-of-sample fold."),
+    step_bars: int | None = typer.Option(None, "--step-bars", min=1, help="Fold step size; defaults to test-bars."),
+    capital: str = typer.Option("10000", "--capital", help="Initial research capital."),
+    fee_bps: float | None = typer.Option(None, "--fee-bps", help="Override preset fee assumption."),
+    slippage_bps: float | None = typer.Option(None, "--slippage-bps", help="Override preset slippage assumption."),
+    leverage: float | None = typer.Option(None, "--leverage", help="Override preset leverage assumption."),
+    position_fraction: float | None = typer.Option(None, "--position-fraction", min=0.01, max=1.0, help="Override preset position fraction."),
+    out_dir: str | None = typer.Option(None, "--out-dir", help="Optional output directory for JSON/SVG/HTML files."),
+) -> None:
+    preset = get_preset(name)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    resolved_out_dir = Path(out_dir) if out_dir else Path("var/walkforward_reports") / f"{preset.market.value}_{name}_{timestamp}"
+    chosen_bars = bars or max(preset.research_bars, train_bars + test_bars)
+    chosen_fee_bps = preset.fee_bps if fee_bps is None else fee_bps
+    chosen_slippage_bps = preset.slippage_bps if slippage_bps is None else slippage_bps
+    chosen_leverage = preset.leverage if leverage is None else leverage
+    chosen_position_fraction = preset.position_fraction if position_fraction is None else position_fraction
+
+    async def _run_spot() -> dict[str, Any]:
+        async with SpotTradingService(get_settings()) as service:
+            strategy = create_builtin_strategy(name=preset.strategy_name, **preset.params)
+            candles = await fetch_recent_candles(service, strategy.symbol, strategy.interval, bars=chosen_bars)
+            report = run_walkforward_analysis(
+                strategy,
+                candles,
+                BacktestConfig(
+                    market_type=MarketType.SPOT,
+                    initial_capital=_float_decimal(capital),
+                    fee_bps=chosen_fee_bps,
+                    slippage_bps=chosen_slippage_bps,
+                    leverage=1.0,
+                    position_fraction=chosen_position_fraction,
+                ),
+                train_bars=train_bars,
+                test_bars=test_bars,
+                step_bars=step_bars,
+            )
+            artifacts = write_walkforward_report(report, resolved_out_dir.resolve())
+            return {"preset": name, "summary": report["summary"], "fold_count": report["fold_count"], "artifacts": artifacts}
+
+    async def _run_futures() -> dict[str, Any]:
+        async with FuturesTradingService(get_settings()) as service:
+            strategy = create_builtin_strategy(name=preset.strategy_name, **preset.params)
+            candles = await fetch_recent_candles(service, strategy.symbol, strategy.interval, bars=chosen_bars)
+            report = run_walkforward_analysis(
+                strategy,
+                candles,
+                BacktestConfig(
+                    market_type=MarketType.FUTURES,
+                    initial_capital=_float_decimal(capital),
+                    fee_bps=chosen_fee_bps,
+                    slippage_bps=chosen_slippage_bps,
+                    leverage=chosen_leverage,
+                    position_fraction=chosen_position_fraction,
+                ),
+                train_bars=train_bars,
+                test_bars=test_bars,
+                step_bars=step_bars,
+            )
+            artifacts = write_walkforward_report(report, resolved_out_dir.resolve())
+            return {"preset": name, "summary": report["summary"], "fold_count": report["fold_count"], "artifacts": artifacts}
+
+    if preset.market is MarketType.SPOT:
+        _run(_run_spot())
+        return
+    _run(_run_futures())
 
 
 @app.command("run-strategy")

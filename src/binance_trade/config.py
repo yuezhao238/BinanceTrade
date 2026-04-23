@@ -7,6 +7,7 @@ from typing import Any
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from .exceptions import ConfigError
 from .types import ApiKeyType, Environment
 
 
@@ -35,6 +36,7 @@ class Settings(BaseSettings):
     futures_default_symbol: str = Field(default="BTCUSDT", alias="FUTURES_DEFAULT_SYMBOL")
     futures_order_prefix: str = Field(default="bf", alias="FUTURES_ORDER_PREFIX")
     state_db_path: Path = Field(default=Path("var/state.db"), alias="STATE_DB_PATH")
+    runtime_dir: Path = Field(default=Path("var/runtime"), alias="RUNTIME_DIR")
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
     dry_run: bool = Field(default=True, alias="DRY_RUN")
 
@@ -49,6 +51,11 @@ class Settings(BaseSettings):
 
     request_timeout_seconds: float = Field(default=10.0, alias="REQUEST_TIMEOUT_SECONDS")
     recv_window_ms: float = Field(default=5000.0, alias="RECV_WINDOW_MS")
+    daemon_heartbeat_interval_seconds: int = Field(default=30, alias="DAEMON_HEARTBEAT_INTERVAL_SECONDS")
+    daemon_reconcile_interval_seconds: int = Field(default=300, alias="DAEMON_RECONCILE_INTERVAL_SECONDS")
+    daemon_restart_delay_seconds: int = Field(default=5, alias="DAEMON_RESTART_DELAY_SECONDS")
+    daemon_max_restart_delay_seconds: int = Field(default=60, alias="DAEMON_MAX_RESTART_DELAY_SECONDS")
+    daemon_stale_after_seconds: int = Field(default=90, alias="DAEMON_STALE_AFTER_SECONDS")
     binance_futures_rest_base_url: str | None = Field(default=None, alias="BINANCE_FUTURES_REST_BASE_URL")
     binance_futures_market_ws_url: str | None = Field(default=None, alias="BINANCE_FUTURES_MARKET_WS_URL")
     binance_futures_user_ws_base_url: str | None = Field(default=None, alias="BINANCE_FUTURES_USER_WS_BASE_URL")
@@ -58,6 +65,19 @@ class Settings(BaseSettings):
     @classmethod
     def _upper_default_symbol(cls, value: str) -> str:
         return value.upper()
+
+    @field_validator(
+        "daemon_heartbeat_interval_seconds",
+        "daemon_reconcile_interval_seconds",
+        "daemon_restart_delay_seconds",
+        "daemon_max_restart_delay_seconds",
+        "daemon_stale_after_seconds",
+    )
+    @classmethod
+    def _positive_seconds(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("daemon timing values must be positive")
+        return value
 
     @field_validator("allowed_symbols", "futures_allowed_symbols", mode="before")
     @classmethod
@@ -74,6 +94,8 @@ class Settings(BaseSettings):
             return self.binance_rest_base_url.rstrip("/")
         if self.binance_env is Environment.TESTNET:
             return "https://testnet.binance.vision"
+        if self.binance_env is Environment.BINANCE_US:
+            return "https://api.binance.us"
         return "https://api.binance.com"
 
     @property
@@ -82,6 +104,8 @@ class Settings(BaseSettings):
             return self.binance_market_ws_url.rstrip("/")
         if self.binance_env is Environment.TESTNET:
             return "wss://stream.testnet.binance.vision/stream"
+        if self.binance_env is Environment.BINANCE_US:
+            return "wss://stream.binance.us:9443/stream"
         return "wss://stream.binance.com:9443/stream"
 
     @property
@@ -90,10 +114,20 @@ class Settings(BaseSettings):
             return self.binance_ws_api_url.rstrip("/")
         if self.binance_env is Environment.TESTNET:
             return "wss://ws-api.testnet.binance.vision/ws-api/v3"
+        if self.binance_env is Environment.BINANCE_US:
+            return "wss://ws-api.binance.us:443/ws-api/v3"
         return "wss://ws-api.binance.com:443/ws-api/v3"
+
+    def assert_futures_supported(self) -> None:
+        if self.binance_env is Environment.BINANCE_US:
+            raise ConfigError(
+                "BINANCE_ENV=binance_us is spot-only in this project. Use BINANCE_ENV=mainnet or "
+                "BINANCE_ENV=testnet for Binance.com USDⓈ-M futures."
+            )
 
     @property
     def resolved_futures_rest_base_url(self) -> str:
+        self.assert_futures_supported()
         if self.binance_futures_rest_base_url:
             return self.binance_futures_rest_base_url.rstrip("/")
         if self.binance_env is Environment.TESTNET:
@@ -102,6 +136,7 @@ class Settings(BaseSettings):
 
     @property
     def resolved_futures_market_ws_url(self) -> str:
+        self.assert_futures_supported()
         if self.binance_futures_market_ws_url:
             return self.binance_futures_market_ws_url.rstrip("/")
         if self.binance_env is Environment.TESTNET:
@@ -110,6 +145,7 @@ class Settings(BaseSettings):
 
     @property
     def resolved_futures_user_ws_base_url(self) -> str:
+        self.assert_futures_supported()
         if self.binance_futures_user_ws_base_url:
             return self.binance_futures_user_ws_base_url.rstrip("/")
         if self.binance_env is Environment.TESTNET:
@@ -118,6 +154,7 @@ class Settings(BaseSettings):
 
     @property
     def resolved_futures_ws_api_url(self) -> str:
+        self.assert_futures_supported()
         if self.binance_futures_ws_api_url:
             return self.binance_futures_ws_api_url.rstrip("/")
         if self.binance_env is Environment.TESTNET:

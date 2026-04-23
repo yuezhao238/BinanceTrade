@@ -1,0 +1,27 @@
+name = "spot-ema-btcusdt"
+market = "spot"
+strategy_ref = "examples/strategies/spot_ema_persistent.py:create_strategy"
+submission_mode = "inherit"
+description = "Persistent BTCUSDT spot EMA daemon profile with user-stream reconciliation and restart supervision."
+notes = [
+  "Use this as the production template, not the one-shot built-in strategies.",
+  "Keep DRY_RUN=true until doctor-runtime-profile, watch-user, and daemon-health are stable.",
+]
+
+[params]
+symbol = "BTCUSDT"
+interval = "1h"
+fast_period = 20
+slow_period = 50
+quote_order_qty = "25"
+warmup_bars = 250
+
+[daemon]
+reconcile_on_start = true
+reconcile_interval_seconds = 300
+heartbeat_interval_seconds = 30
+auto_restart = true
+restart_initial_delay_seconds = 5
+restart_max_delay_seconds = 60
+stop_on_strategy_exit = false
+stale_after_seconds = 90

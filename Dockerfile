@@ -7,7 +7,8 @@ WORKDIR /app
 
 COPY pyproject.toml README.md ./
 COPY src ./src
+COPY examples ./examples
 
 RUN pip install --no-cache-dir .
 
-CMD ["binance-trade", "doctor"]
+CMD ["binance-trade", "--help"]

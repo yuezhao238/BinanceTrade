@@ -104,8 +104,18 @@ def rolling_std(values: list[float], period: int) -> float | None:
 
 
 def rsi(values: list[float], period: int = 14) -> float | None:
+    series = _rsi_wilder_series(values, period)
+    return None if len(series) <= period else series[-1]
+
+
+def rsi_series(values: list[float], period: int = 14) -> list[float]:
+    return [value for value in _rsi_wilder_series(values, period) if value is not None]
+
+
+def _rsi_wilder_series(values: list[float], period: int = 14) -> list[float | None]:
     if len(values) <= period:
-        return None
+        return [None] * len(values)
+    result: list[float | None] = [None] * len(values)
     gains: list[float] = []
     losses: list[float] = []
     for index in range(1, period + 1):
@@ -114,24 +124,14 @@ def rsi(values: list[float], period: int = 14) -> float | None:
         losses.append(max(-delta, 0))
     avg_gain = fmean(gains)
     avg_loss = fmean(losses)
+    result[period] = 100.0 if avg_loss == 0 else 100 - (100 / (1 + (avg_gain / avg_loss)))
     for index in range(period + 1, len(values)):
         delta = values[index] - values[index - 1]
         gain = max(delta, 0)
         loss = max(-delta, 0)
         avg_gain = ((avg_gain * (period - 1)) + gain) / period
         avg_loss = ((avg_loss * (period - 1)) + loss) / period
-    if avg_loss == 0:
-        return 100.0
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
-
-
-def rsi_series(values: list[float], period: int = 14) -> list[float]:
-    result: list[float] = []
-    for index in range(period, len(values)):
-        current = rsi(values[: index + 1], period)
-        if current is not None:
-            result.append(current)
+        result[index] = 100.0 if avg_loss == 0 else 100 - (100 / (1 + (avg_gain / avg_loss)))
     return result
 
 
@@ -162,7 +162,7 @@ def stoch(high_values: list[float], low_values: list[float], close_values: list[
 
 
 def stoch_rsi(values: list[float], period: int = 14, smooth_k: int = 3, smooth_d: int = 3) -> tuple[float, float] | None:
-    rsi_values = rsi_series(values, period)
+    rsi_values = [value for value in _rsi_wilder_series(values, period) if value is not None]
     if len(rsi_values) < period + smooth_d:
         return None
     raw_values: list[float] = []

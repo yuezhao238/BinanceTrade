@@ -5,5 +5,12 @@ services:
       - .env
     volumes:
       - ./var:/app/var
+      - ./examples:/app/examples:ro
     restart: unless-stopped
-    command: ["binance-trade", "doctor"]
+    command: ["binance-trade", "run-daemon", "examples/runtime/spot_ema_btcusdt.toml"]
+    healthcheck:
+      test: ["CMD", "binance-trade", "daemon-health", "spot-ema-btcusdt"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 45s
