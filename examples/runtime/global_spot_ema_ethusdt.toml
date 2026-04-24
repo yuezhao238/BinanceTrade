@@ -12,7 +12,7 @@ symbol = "ETHUSDT"
 interval = "1h"
 fast_period = 20
 slow_period = 50
-quote_order_qty = "100"
+quote_order_qty = "98.42"
 warmup_bars = 250
 
 [daemon]

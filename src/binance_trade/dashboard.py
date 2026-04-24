@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -17,12 +18,13 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from .builtin_strategies import create_strategy as create_builtin_strategy
 from .builtin_strategies import ema_series, list_strategies
 from .config import Settings
 from .daemon import is_runtime_stack_status_healthy, is_runtime_status_healthy
 from .exceptions import BinanceTradeError
 from .presets import list_presets as list_research_presets
-from .research import benchmark_builtin_strategies, fetch_recent_candles, interval_to_minutes
+from .research import BacktestConfig, benchmark_builtin_strategies, fetch_recent_candles, interval_to_minutes, run_backtest_with_options
 from .runtime_profiles import RuntimeProfile, RuntimeStack, load_runtime_profile, load_runtime_stack
 from .service import FuturesTradingService, SpotTradingService
 from .state import SQLiteStateStore
@@ -153,6 +155,7 @@ class DashboardDataService:
         self.control_plane = control_plane
         self.control_dir = settings.runtime_dir / "control"
         self.research_state_path = self.control_dir / "research_state.json"
+        self.deployment_suggestions_path = self.control_dir / "deployment_suggestions.json"
         self._portfolio_lock = threading.Lock()
         self._portfolio_cache: dict[str, Any] | None = None
         self._portfolio_cached_at = 0.0
@@ -172,6 +175,15 @@ class DashboardDataService:
         portfolio = self._portfolio_section() if self.config.include_portfolio else {"enabled": False}
         research = self._research_section()
         runtime_files = self._runtime_files()
+        controls = None if self.control_plane is None else self.control_plane.describe()
+        deployment = self._deployment_section(
+            controls=controls,
+            raw_services=raw_services,
+            strategy_charts=strategy_charts,
+            portfolio=portfolio,
+            orders=orders,
+            events=events,
+        )
         return {
             "generated_at": utc_now_iso(),
             "environment": self.settings.binance_env.value,
@@ -191,8 +203,9 @@ class DashboardDataService:
             "events": events,
             "portfolio": portfolio,
             "research": research,
+            "deployment": deployment,
             "runtime_files": runtime_files,
-            "controls": None if self.control_plane is None else self.control_plane.describe(),
+            "controls": controls,
         }
 
     def _portfolio_section(self) -> dict[str, Any]:
@@ -476,6 +489,286 @@ class DashboardDataService:
             )
         return rows
 
+    def _deployment_section(
+        self,
+        *,
+        controls: dict[str, Any] | None,
+        raw_services: list[dict[str, Any]],
+        strategy_charts: list[dict[str, Any]],
+        portfolio: dict[str, Any],
+        orders: list[dict[str, Any]],
+        events: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        if not controls:
+            return {"enabled": False}
+
+        stack_rows = controls.get("available_stacks") or []
+        if not stack_rows:
+            return {"enabled": True, "stacks": [], "default_total_budget": 0.0}
+
+        suggestion_rows = self._load_or_compute_deployment_suggestions(stack_rows)
+        suggestions_by_path = {row["profile_path"]: row for row in suggestion_rows}
+        runtime_by_service = {item.get("service_name"): item for item in raw_services}
+        chart_by_service = {item.get("service_name"): item for item in strategy_charts}
+        default_total_budget = self._deployment_default_budget(portfolio, stack_rows)
+        stacks: list[dict[str, Any]] = []
+
+        for stack in stack_rows:
+            profiles = []
+            generated_stack = bool(stack.get("generated"))
+            current_budget_total = sum(_float_or_none(profile.get("budget_value")) or 0.0 for profile in stack.get("profiles", []))
+            positive_score_total = sum(
+                max(0.0, float((suggestions_by_path.get(profile["path"]) or {}).get("score", 0.0)))
+                for profile in stack.get("profiles", [])
+            )
+            for profile in stack.get("profiles", []):
+                suggestion = suggestions_by_path.get(profile["path"], {})
+                raw_score = max(0.0, float(suggestion.get("score", 0.0)))
+                current_budget = _float_or_none(profile.get("budget_value")) or 0.0
+                if generated_stack and current_budget_total > 0:
+                    suggested_weight = (current_budget / current_budget_total) * 100
+                else:
+                    suggested_weight = (
+                        (raw_score / positive_score_total) * 100
+                        if positive_score_total > 0
+                        else (100 / max(len(stack.get("profiles", [])), 1))
+                    )
+                runtime_item = runtime_by_service.get(profile["name"])
+                chart_item = chart_by_service.get(profile["name"])
+                profiles.append(
+                    {
+                        **profile,
+                        "current_budget": current_budget,
+                        "suggested_weight_pct": round(suggested_weight, 2),
+                        "suggested_budget": round(default_total_budget * (suggested_weight / 100), 2),
+                        "history_score": round(raw_score, 4) if raw_score else 0.0,
+                        "history_metrics": suggestion.get("metrics"),
+                        "history_basis": (
+                            "Preserving Strategy Lab allocation ratios from the generated stack."
+                            if generated_stack and current_budget_total > 0
+                            else suggestion.get("basis")
+                        ),
+                        "status": None if runtime_item is None else runtime_item.get("status"),
+                        "submission_mode": None if runtime_item is None else runtime_item.get("submission_mode"),
+                        "has_live_chart": chart_item is not None,
+                        "last_close": None if chart_item is None else chart_item.get("last_close"),
+                        "last_close_time": None if chart_item is None else chart_item.get("last_close_time"),
+                        "activity": self._profile_activity(
+                            profile=profile,
+                            runtime_item=runtime_item,
+                            orders=orders,
+                            events=events,
+                        ),
+                    }
+                )
+            stacks.append(
+                {
+                    "name": stack["name"],
+                    "path": stack["path"],
+                    "generated": generated_stack,
+                    "profile_count": len(profiles),
+                    "profiles": profiles,
+                }
+            )
+
+        return {
+            "enabled": True,
+            "default_stack_path": stacks[0]["path"] if stacks else None,
+            "default_total_budget": round(default_total_budget, 2),
+            "stacks": stacks,
+        }
+
+    def _deployment_default_budget(self, portfolio: dict[str, Any], stack_rows: list[dict[str, Any]]) -> float:
+        if portfolio.get("ok"):
+            for item in portfolio.get("spot_balances", []):
+                if str(item.get("asset", "")).upper() == "USDT":
+                    total = _float_or_none(item.get("free"))
+                    if total and total > 0:
+                        return total
+        fallback = 0.0
+        first_stack = stack_rows[0] if stack_rows else {}
+        for profile in first_stack.get("profiles", []):
+            fallback += _float_or_none(profile.get("budget_value")) or 0.0
+        return fallback
+
+    def _load_or_compute_deployment_suggestions(self, stack_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        profile_paths = [profile["path"] for stack in stack_rows for profile in stack.get("profiles", [])]
+        if not profile_paths:
+            return []
+
+        cache_payload: dict[str, Any] | None = None
+        if self.deployment_suggestions_path.exists():
+            try:
+                cache_payload = json.loads(self.deployment_suggestions_path.read_text(encoding="utf-8"))
+            except Exception:
+                cache_payload = None
+        if cache_payload:
+            generated_at = _float_or_none(cache_payload.get("generated_at_epoch"))
+            cached_profiles = cache_payload.get("profiles") or {}
+            if (
+                generated_at is not None
+                and (time.time() - generated_at) < 1800
+                and all(path in cached_profiles for path in profile_paths)
+            ):
+                return [cached_profiles[path] for path in profile_paths]
+
+        try:
+            suggestions = asyncio.run(self._compute_deployment_suggestions(profile_paths))
+        except Exception as exc:
+            LOGGER.warning("deployment suggestion refresh failed: %s", exc)
+            if cache_payload:
+                cached_profiles = cache_payload.get("profiles") or {}
+                return [cached_profiles[path] for path in profile_paths if path in cached_profiles]
+            return []
+
+        cache_payload = {
+            "generated_at": utc_now_iso(),
+            "generated_at_epoch": time.time(),
+            "profiles": {row["profile_path"]: row for row in suggestions},
+        }
+        self.deployment_suggestions_path.write_text(json_dumps(cache_payload), encoding="utf-8")
+        return suggestions
+
+    async def _compute_deployment_suggestions(self, profile_paths: list[str]) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        async with SpotTradingService(self.settings) as service:
+            for path in profile_paths:
+                profile = load_runtime_profile(path)
+                if profile.market is not MarketType.SPOT:
+                    rows.append(
+                        {
+                            "profile_path": str(path),
+                            "score": 1.0,
+                            "basis": "No spot replay available; using equal-weight fallback.",
+                            "metrics": None,
+                        }
+                    )
+                    continue
+                rows.append(await self._profile_spot_suggestion(service, profile))
+        return rows
+
+    async def _profile_spot_suggestion(self, service: SpotTradingService, profile: RuntimeProfile) -> dict[str, Any]:
+        symbol = str(profile.params.get("symbol", "")).upper()
+        interval = str(profile.params.get("interval", "1h")).strip()
+        quote_order_qty = profile.params.get("quote_order_qty", "25")
+        if not symbol or not interval:
+            return {
+                "profile_path": str(profile.path),
+                "score": 1.0,
+                "basis": "Missing symbol or interval; using equal-weight fallback.",
+                "metrics": None,
+            }
+
+        bars = max(500, min(1200, int(_int_or_none(profile.params.get("warmup_bars")) or 250) * 4))
+        candles = await fetch_recent_candles(service, symbol, interval, bars=bars)
+        strategy_name = "ema_crossover"
+        strategy_kwargs: dict[str, Any] = {
+            "symbol": symbol,
+            "interval": interval,
+            "quote_order_qty": str(quote_order_qty),
+            "trade_side": str(profile.params.get("trade_side", "long") or "long"),
+            "warmup_bars": int(_int_or_none(profile.params.get("warmup_bars")) or 250),
+        }
+        if str(profile.strategy_ref).endswith("spot_builtin_persistent.py:create_strategy"):
+            strategy_name = str(profile.params.get("strategy_name", "")).strip().lower()
+            if not strategy_name:
+                return {
+                    "profile_path": str(profile.path),
+                    "score": 1.0,
+                    "basis": "Missing built-in strategy name; using equal-weight fallback.",
+                    "metrics": None,
+                }
+            for key, value in profile.params.items():
+                if key == "strategy_name":
+                    continue
+                strategy_kwargs[key] = value
+        else:
+            fast_period = _int_or_none(profile.params.get("fast_period"))
+            slow_period = _int_or_none(profile.params.get("slow_period"))
+            if fast_period is None or slow_period is None:
+                return {
+                    "profile_path": str(profile.path),
+                    "score": 1.0,
+                    "basis": "Missing EMA parameters; using equal-weight fallback.",
+                    "metrics": None,
+                }
+            strategy_kwargs["fast_period"] = fast_period
+            strategy_kwargs["slow_period"] = slow_period
+
+        strategy = create_builtin_strategy(name=strategy_name, **strategy_kwargs)
+        result = run_backtest_with_options(
+            strategy,
+            candles,
+            BacktestConfig(
+                market_type=MarketType.SPOT,
+                initial_capital=1000.0,
+                fee_bps=10.0,
+                slippage_bps=2.0,
+                leverage=1.0,
+                position_fraction=1.0,
+            ),
+            include_equity_curve=False,
+        )
+        metrics = result.get("metrics") or {}
+        sharpe = float(metrics.get("sharpe") or 0.0)
+        profit_factor = float(metrics.get("profit_factor") or 0.0)
+        total_return = float(metrics.get("total_return_pct") or 0.0)
+        drawdown = float(metrics.get("max_drawdown_pct") or 0.0)
+        score = max(0.0, total_return - (drawdown * 0.55) + (sharpe * 12.0) + max(profit_factor - 1.0, 0.0) * 18.0)
+        sample_days = metrics.get("sample_days")
+        return {
+            "profile_path": str(profile.path),
+            "score": round(score, 4),
+            "basis": (
+                f"Historical {strategy_name.replace('_', ' ')} replay on {symbol} {interval}; "
+                f"return {total_return:.2f}%, drawdown {drawdown:.2f}%, "
+                f"Sharpe {sharpe:.2f}, sample {sample_days or '—'} days."
+            ),
+            "metrics": metrics,
+        }
+
+    def _profile_activity(
+        self,
+        *,
+        profile: dict[str, Any],
+        runtime_item: dict[str, Any] | None,
+        orders: list[dict[str, Any]],
+        events: list[dict[str, Any]],
+    ) -> list[str]:
+        symbol = str(profile.get("symbol") or "").upper()
+        service_name = str(profile.get("name") or "")
+        rows: list[str] = []
+
+        if runtime_item:
+            status = str(runtime_item.get("status") or "UNKNOWN")
+            updated_at = runtime_item.get("updated_at") or runtime_item.get("last_heartbeat_at")
+            rows.append(f"{service_name} is {status} as of {updated_at or '—'}.")
+
+        for item in orders:
+            if str(item.get("symbol") or "").upper() != symbol:
+                continue
+            rows.append(
+                f"Order {item.get('side') or '—'} {item.get('order_type') or '—'} "
+                f"{item.get('status') or '—'} at {item.get('updated_at') or item.get('created_at') or '—'}."
+            )
+            if len(rows) >= 4:
+                return rows
+
+        for item in events:
+            event_symbol = str(item.get("symbol") or "").upper()
+            payload = item.get("payload") or {}
+            payload_service = str(payload.get("service_name") or payload.get("summary", {}).get("service_name") or "")
+            if event_symbol and event_symbol != symbol and payload_service != service_name:
+                continue
+            label = item.get("event_type") or item.get("channel") or "event"
+            rows.append(f"{label} recorded at {item.get('created_at') or '—'}.")
+            if len(rows) >= 4:
+                break
+
+        if not rows:
+            rows.append("No recent live actions yet. Start the daemon and wait for the next signal.")
+        return rows
+
     def _research_section(self) -> dict[str, Any]:
         strategies = list_strategies()
         presets = [
@@ -515,6 +808,8 @@ class DashboardControlPlane:
         self.settings = settings
         self.workspace_root = (workspace_root or Path.cwd()).resolve()
         self.runtime_examples_dir = self.workspace_root / "examples" / "runtime"
+        self.generated_runtime_dir = settings.runtime_dir / "generated"
+        self.generated_runtime_dir.mkdir(parents=True, exist_ok=True)
         self.control_dir = settings.runtime_dir / "control"
         self.control_dir.mkdir(parents=True, exist_ok=True)
         self.research_state_path = self.control_dir / "research_state.json"
@@ -533,7 +828,10 @@ class DashboardControlPlane:
             raise ValueError("action is required")
 
         if action == "start_stack":
-            return self._start_stack(self._required_path(payload))
+            return self._start_stack(
+                self._required_path(payload),
+                budget_overrides=payload.get("budget_overrides"),
+            )
         if action == "stop_stack":
             return self._stop_stack(self._required_identifier(payload, field="stack_name"), path=payload.get("path"))
         if action == "start_profile":
@@ -575,6 +873,8 @@ class DashboardControlPlane:
             )
         if action == "research_scan":
             return self._research_scan(payload)
+        if action == "generate_research_stack":
+            return self._generate_research_stack(payload)
         if action == "refresh_portfolio":
             return {"status": "OK", "message": "Refresh portfolio by reloading the page or waiting for the next polling cycle."}
         raise ValueError(f"unsupported action {action!r}")
@@ -603,25 +903,70 @@ class DashboardControlPlane:
         raw = str(payload.get("submission_mode", "DRY_RUN")).strip().upper()
         return SubmissionMode(raw)
 
+    def _runtime_definition_paths(self) -> list[Path]:
+        paths: list[Path] = []
+        seen: set[Path] = set()
+        for root in (self.runtime_examples_dir, self.generated_runtime_dir):
+            if not root.exists():
+                continue
+            for path in sorted(root.rglob("*.toml")):
+                resolved = path.resolve()
+                if resolved in seen:
+                    continue
+                seen.add(resolved)
+                paths.append(resolved)
+        return paths
+
+    def _is_generated_runtime_path(self, path: Path) -> bool:
+        try:
+            path.resolve().relative_to(self.generated_runtime_dir.resolve())
+        except ValueError:
+            return False
+        return True
+
     def _discover_stacks(self) -> list[dict[str, Any]]:
         rows = []
-        for path in sorted(self.runtime_examples_dir.glob("*.toml")):
+        for path in self._runtime_definition_paths():
             try:
                 stack = load_runtime_stack(path)
             except Exception:
                 continue
-            rows.append({"name": stack.name, "path": str(path.resolve())})
+            rows.append(
+                {
+                    "name": stack.name,
+                    "path": str(path.resolve()),
+                    "generated": self._is_generated_runtime_path(path),
+                    "profile_count": len(stack.profiles),
+                    "profiles": [self._profile_summary(profile) for profile in stack.profiles],
+                }
+            )
         return rows
 
     def _discover_profiles(self) -> list[dict[str, Any]]:
         rows = []
-        for path in sorted(self.runtime_examples_dir.glob("*.toml")):
+        for path in self._runtime_definition_paths():
             try:
                 profile = load_runtime_profile(path)
             except Exception:
                 continue
-            rows.append({"name": profile.name, "market": profile.market.value, "path": str(path.resolve())})
+            rows.append(self._profile_summary(profile))
         return rows
+
+    def _profile_summary(self, profile: RuntimeProfile) -> dict[str, Any]:
+        budget_key = "quote_order_qty" if profile.market is MarketType.SPOT else "quantity"
+        budget_value = profile.params.get(budget_key)
+        return {
+            "name": profile.name,
+            "market": profile.market.value,
+            "path": str((profile.path or Path(".")).resolve()),
+            "generated": False if profile.path is None else self._is_generated_runtime_path(profile.path),
+            "symbol": str(profile.params.get("symbol", "")).upper() or None,
+            "interval": str(profile.params.get("interval", "")) or None,
+            "strategy_ref": profile.strategy_ref,
+            "strategy_label": _strategy_label(profile.strategy_ref),
+            "budget_key": budget_key,
+            "budget_value": None if budget_value is None else str(budget_value),
+        }
 
     def _research_categories(self) -> list[dict[str, Any]]:
         counts: dict[str, int] = {}
@@ -729,11 +1074,15 @@ class DashboardControlPlane:
         metadata_path.write_text(json_dumps(payload), encoding="utf-8")
         return {"status": "STOP_SIGNAL_SENT", **payload}
 
-    def _start_stack(self, path: str) -> dict[str, Any]:
+    def _start_stack(self, path: str, *, budget_overrides: Any = None) -> dict[str, Any]:
         resolved = self._resolve_path(path)
         stack = load_runtime_stack(resolved)
+        applied_budget_updates = self._apply_budget_overrides(stack=stack, budget_overrides=budget_overrides)
         command = [sys.executable, "-m", "binance_trade.cli", "run-daemon-stack", str(resolved)]
-        return self._start_process(kind="stack", name=stack.name, path=resolved, command=command)
+        result = self._start_process(kind="stack", name=stack.name, path=resolved, command=command)
+        if applied_budget_updates:
+            result["budget_updates"] = applied_budget_updates
+        return result
 
     def _stop_stack(self, stack_name: str, *, path: Any = None) -> dict[str, Any]:
         if path:
@@ -752,6 +1101,203 @@ class DashboardControlPlane:
             resolved = self._resolve_path(str(path))
             profile_name = load_runtime_profile(resolved).name
         return self._stop_process(kind="profile", name=profile_name)
+
+    def _apply_budget_overrides(self, *, stack: RuntimeStack, budget_overrides: Any) -> list[dict[str, Any]]:
+        if not isinstance(budget_overrides, dict):
+            return []
+        updates: list[dict[str, Any]] = []
+        for profile in stack.profiles:
+            raw_value = budget_overrides.get(profile.name)
+            if raw_value in (None, "", False):
+                continue
+            numeric = Decimal(str(raw_value))
+            if numeric <= 0:
+                continue
+            key = "quote_order_qty" if profile.market is MarketType.SPOT else "quantity"
+            if profile.path is None:
+                continue
+            rendered = format(numeric, "f")
+            self._write_profile_param(profile.path, key, rendered)
+            updates.append({"profile_name": profile.name, "param": key, "value": rendered})
+        return updates
+
+    def _write_profile_param(self, path: Path, key: str, value: str) -> None:
+        text = path.read_text(encoding="utf-8")
+        lines = text.splitlines()
+        params_start = None
+        params_end = len(lines)
+        for index, line in enumerate(lines):
+            if line.strip() == "[params]":
+                params_start = index
+                continue
+            if params_start is not None and index > params_start and line.strip().startswith("[") and line.strip().endswith("]"):
+                params_end = index
+                break
+        if params_start is None:
+            raise ValueError(f"{path} is missing a [params] section")
+
+        key_pattern = re.compile(rf"^\s*{re.escape(key)}\s*=")
+        replacement = f'{key} = "{value}"'
+        for index in range(params_start + 1, params_end):
+            if key_pattern.match(lines[index]):
+                lines[index] = replacement
+                path.write_text("\n".join(lines) + ("\n" if text.endswith("\n") else ""), encoding="utf-8")
+                return
+
+        lines.insert(params_end, replacement)
+        path.write_text("\n".join(lines) + ("\n" if text.endswith("\n") else ""), encoding="utf-8")
+
+    def _generate_research_stack(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if not self.research_state_path.exists():
+            raise ValueError("run a Strategy Lab scan before generating a deployable stack")
+        research_state = json.loads(self.research_state_path.read_text(encoding="utf-8"))
+        request = research_state.get("request") or {}
+        market = str(request.get("market", "spot")).strip().lower()
+        if market != "spot":
+            raise ValueError("Strategy Lab deployment generation currently supports spot research only")
+
+        allocations = research_state.get("allocations") or []
+        if not allocations:
+            raise ValueError("the latest Strategy Lab scan has no funded allocations to deploy")
+
+        stack_name = self._generated_stack_name(payload=payload, request=request)
+        stack_dir = self.generated_runtime_dir / stack_name
+        stack_dir.mkdir(parents=True, exist_ok=False)
+
+        profile_refs: list[str] = []
+        for item in allocations:
+            profile_name = f"{stack_name}-{self._slugify(str(item.get('name', 'strategy')))}"
+            profile_file = f"{profile_name}.toml"
+            profile_path = stack_dir / profile_file
+            profile_path.write_text(
+                self._render_generated_profile(
+                    profile_name=profile_name,
+                    item=item,
+                    request=request,
+                ),
+                encoding="utf-8",
+            )
+            profile_refs.append(profile_file)
+
+        stack_path = stack_dir / f"{stack_name}.toml"
+        stack_path.write_text(
+            self._render_generated_stack(
+                stack_name=stack_name,
+                profile_refs=profile_refs,
+                request=request,
+                research_state=research_state,
+            ),
+            encoding="utf-8",
+        )
+        stack = load_runtime_stack(stack_path)
+        generated = {
+            "name": stack.name,
+            "path": str(stack_path.resolve()),
+            "profile_count": len(stack.profiles),
+            "profiles": [self._profile_summary(profile) for profile in stack.profiles],
+            "generated_at": utc_now_iso(),
+        }
+        research_state["generated_stack"] = generated
+        self.research_state_path.write_text(json_dumps(research_state), encoding="utf-8")
+        return {"status": "OK", "stack": generated}
+
+    def _generated_stack_name(self, *, payload: dict[str, Any], request: dict[str, Any]) -> str:
+        requested = str(payload.get("stack_name", "")).strip()
+        if requested:
+            base = requested
+        else:
+            symbol = str(request.get("symbol", "spot")).lower()
+            interval = str(request.get("interval", "scan")).lower()
+            base = f"lab-{symbol}-{interval}"
+        slug = self._slugify(base) or "lab-stack"
+        timestamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
+        return f"{slug}-{timestamp}"
+
+    def _slugify(self, value: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+
+    def _render_generated_profile(self, *, profile_name: str, item: dict[str, Any], request: dict[str, Any]) -> str:
+        strategy_name = str(item.get("name", "")).strip().lower()
+        if not strategy_name:
+            raise ValueError("generated research allocation is missing a strategy name")
+        symbol = str(request.get("symbol", "BTCUSDT")).strip().upper()
+        interval = str(request.get("interval", "1h")).strip()
+        budget_amount = Decimal(str(item.get("budget_amount", "0")))
+        allocation_pct = float(item.get("allocation_pct", 0.0) or 0.0)
+        warmup_bars = max(250, min(1500, int(_int_or_none(request.get("bars")) or 250)))
+        title = str(item.get("title", strategy_name)).strip()
+        description = str(item.get("description") or f"{title} generated from Strategy Lab.").strip()
+        notes = [
+            "Generated from Strategy Lab research output.",
+            f"Historical allocation {allocation_pct:.2f}% of the deployable budget.",
+            (
+                f"Research return {float(item.get('metrics', {}).get('total_return_pct') or 0.0):.2f}% · "
+                f"drawdown {float(item.get('metrics', {}).get('max_drawdown_pct') or 0.0):.2f}% · "
+                f"score {float(item.get('score') or 0.0):.4f}."
+            ),
+        ]
+        return "\n".join(
+            [
+                f"name = {json.dumps(profile_name, ensure_ascii=False)}",
+                'market = "spot"',
+                'strategy_ref = "examples/strategies/spot_builtin_persistent.py:create_strategy"',
+                'submission_mode = "inherit"',
+                f"description = {json.dumps(description, ensure_ascii=False)}",
+                f"notes = {json.dumps(notes, ensure_ascii=False)}",
+                "",
+                "[params]",
+                f"strategy_name = {json.dumps(strategy_name, ensure_ascii=False)}",
+                f"symbol = {json.dumps(symbol, ensure_ascii=False)}",
+                f"interval = {json.dumps(interval, ensure_ascii=False)}",
+                f'quote_order_qty = "{format(budget_amount, "f")}"',
+                'trade_side = "long"',
+                f"warmup_bars = {warmup_bars}",
+                "",
+                "[daemon]",
+                "reconcile_on_start = true",
+                "reconcile_interval_seconds = 300",
+                "heartbeat_interval_seconds = 30",
+                "auto_restart = true",
+                "restart_initial_delay_seconds = 5",
+                "restart_max_delay_seconds = 60",
+                "stop_on_strategy_exit = false",
+                "stale_after_seconds = 90",
+                "",
+            ]
+        )
+
+    def _render_generated_stack(
+        self,
+        *,
+        stack_name: str,
+        profile_refs: list[str],
+        request: dict[str, Any],
+        research_state: dict[str, Any],
+    ) -> str:
+        summary = research_state.get("summary") or {}
+        symbol = str(request.get("symbol", "BTCUSDT"))
+        interval = str(request.get("interval", "1h"))
+        notes = [
+            "Generated automatically from Strategy Lab.",
+            f"Market {request.get('market', 'spot')} · symbol {symbol} · interval {interval}.",
+            f"Deployable budget in research: {summary.get('deployable_budget', 0)} USDT.",
+        ]
+        description = f"Strategy Lab generated stack for {symbol} {interval}."
+        return "\n".join(
+            [
+                f"name = {json.dumps(stack_name, ensure_ascii=False)}",
+                f"description = {json.dumps(description, ensure_ascii=False)}",
+                f"notes = {json.dumps(notes, ensure_ascii=False)}",
+                f"profiles = {json.dumps(profile_refs, ensure_ascii=False)}",
+                "",
+                "[settings]",
+                "heartbeat_interval_seconds = 30",
+                "stale_after_seconds = 90",
+                "stop_on_member_exit = true",
+                "stop_on_member_failure = true",
+                "",
+            ]
+        )
 
     def _doctor_stack(self, path: str) -> dict[str, Any]:
         stack = load_runtime_stack(self._resolve_path(path))
@@ -1726,6 +2272,87 @@ DASHBOARD_TEMPLATE = """<!doctype html>
       gap: 8px;
       flex-wrap: wrap;
     }
+    .lang-toggle, .panel-tab {
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 10px 14px;
+      font: inherit;
+      background: rgba(255,255,255,0.88);
+      color: var(--ink);
+      cursor: pointer;
+      transition: transform 140ms ease, background 140ms ease, border-color 140ms ease;
+    }
+    .lang-toggle:hover, .panel-tab:hover {
+      transform: translateY(-1px);
+      border-color: rgba(23,22,26,0.18);
+    }
+    .panel-tabs {
+      display: flex;
+      gap: 10px;
+      margin: 0 0 18px;
+      flex-wrap: wrap;
+    }
+    .panel-tab.active {
+      background: linear-gradient(180deg, #fffaf1 0%, #f0e1c3 100%);
+      border-color: rgba(211,155,42,0.4);
+      font-weight: 700;
+    }
+    [data-panel].is-hidden {
+      display: none !important;
+    }
+    .deployment-layout {
+      align-items: start;
+      grid-template-columns: 1.1fr 0.9fr;
+    }
+    .deployment-profile-grid {
+      display: grid;
+      gap: 10px;
+      margin-top: 4px;
+    }
+    .deployment-profile-row {
+      padding: 12px;
+      border-radius: 16px;
+      border: 1px solid var(--line);
+      background: rgba(255,255,255,0.74);
+    }
+    .deployment-profile-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      align-items: start;
+      margin-bottom: 8px;
+    }
+    .deployment-profile-meta {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px 10px;
+      font-size: 13px;
+      margin-top: 8px;
+    }
+    .deployment-profile-meta span {
+      color: var(--muted);
+      display: block;
+      margin-bottom: 2px;
+    }
+    .live-overview-grid {
+      display: grid;
+      gap: 10px;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+    .advanced-details > summary {
+      cursor: pointer;
+      font-weight: 600;
+      color: var(--ink);
+      list-style: none;
+    }
+    .advanced-details > summary::-webkit-details-marker {
+      display: none;
+    }
+    .advanced-details > summary::after {
+      content: "▾";
+      margin-left: 8px;
+      color: var(--muted);
+    }
     .response-box {
       margin-top: 10px;
       padding: 12px;
@@ -1873,6 +2500,7 @@ DASHBOARD_TEMPLATE = """<!doctype html>
     }
     .chart-wrap {
       margin-top: 14px;
+      position: relative;
       border-radius: 18px;
       border: 1px solid var(--line);
       background:
@@ -1884,6 +2512,20 @@ DASHBOARD_TEMPLATE = """<!doctype html>
       width: 100%;
       height: auto;
       display: block;
+    }
+    .chart-card.placeholder {
+      border-style: dashed;
+    }
+    .chart-empty-copy {
+      position: absolute;
+      inset: 0;
+      display: grid;
+      place-items: center;
+      color: var(--muted);
+      font-size: 13px;
+      text-align: center;
+      padding: 12px 48px;
+      pointer-events: none;
     }
     .chart-legend {
       display: flex;
@@ -1904,10 +2546,31 @@ DASHBOARD_TEMPLATE = """<!doctype html>
       border-radius: 999px;
       background: currentColor;
     }
+    .activity-log {
+      margin-top: 12px;
+      padding-top: 12px;
+      border-top: 1px solid var(--line);
+    }
+    .activity-log h4 {
+      margin: 0 0 8px;
+      font-size: 13px;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+    .activity-list {
+      margin: 0;
+      padding-left: 18px;
+      display: grid;
+      gap: 6px;
+      color: var(--ink);
+      font-size: 13px;
+    }
     @media (max-width: 1180px) {
       .hero, .panel-grid { grid-template-columns: 1fr; }
       .wide { grid-column: span 1; }
       .ops-grid { grid-template-columns: 1fr 1fr; }
+      .deployment-layout,
       .research-layout,
       .chart-grid { grid-template-columns: 1fr; }
       .candidate-grid,
@@ -1924,92 +2587,144 @@ DASHBOARD_TEMPLATE = """<!doctype html>
   <div class="shell">
     <section class="hero">
       <div class="hero-card">
-        <div class="eyebrow">BinanceTrade Runtime</div>
-        <h1>Local Ops Dashboard</h1>
-        <p>Monitors supervised stacks, service heartbeats, recent orders, event flow, and wallet allocation from the same local workspace state that drives the daemon.</p>
+        <div class="toolbar" style="align-items:flex-start">
+          <div>
+            <div class="eyebrow" data-i18n="hero.eyebrow">BinanceTrade Runtime</div>
+            <h1 data-i18n="hero.title">Local Ops Dashboard</h1>
+            <p data-i18n="hero.copy">A two-panel workspace for research and live trading. Configure a deployable budget, launch a daemon, and watch strategy curves, metrics, and actions update from the same local state.</p>
+          </div>
+          <button type="button" class="lang-toggle" id="langToggle" onclick="toggleLocale()">中文</button>
+        </div>
         <div class="status-badge"><span id="generatedAt">Waiting for first snapshot…</span></div>
       </div>
       <div class="summary-grid" id="summaryGrid"></div>
     </section>
 
+    <nav class="panel-tabs" aria-label="Dashboard panels">
+      <button type="button" id="tabLive" class="panel-tab active" onclick="switchPanel('live')" data-i18n="tabs.live">Live Console</button>
+      <button type="button" id="tabResearch" class="panel-tab" onclick="switchPanel('research')" data-i18n="tabs.research">Research Lab</button>
+    </nav>
+
     <section class="panel-grid">
-      <section class="panel">
+      <section class="panel" data-panel="live">
         <div class="toolbar">
-          <h2>Stacks</h2>
+          <h2 data-i18n="stacks.title">Stacks</h2>
           <div class="subtle" id="environmentLabel"></div>
         </div>
         <div class="list" id="stackList"></div>
       </section>
 
-      <section class="panel">
+      <section class="panel" data-panel="live">
         <div class="toolbar">
-          <h2>Services</h2>
-          <div class="subtle">Daemon members and last heartbeat</div>
+          <h2 data-i18n="services.title">Services</h2>
+          <div class="subtle" data-i18n="services.subtitle">Daemon members and latest heartbeat</div>
         </div>
         <div class="list" id="serviceList"></div>
       </section>
 
-      <section class="panel wide">
+      <section class="panel wide" data-panel="live">
         <div class="toolbar">
-          <h2>Live Strategy Charts</h2>
-          <div class="subtle">Current runtime strategy state, latest K-line history, and live indicator overlays</div>
+          <h2 data-i18n="deployment.title">Live Deployment</h2>
+          <div class="subtle" id="deploymentStatus" data-i18n="deployment.subtitle">Choose a stack, review the historical budget suggestion for each strategy, then start the daemon.</div>
+        </div>
+        <div class="split deployment-layout">
+          <article class="ops-card">
+            <h3 data-i18n="deployment.plan">Deployment Plan</h3>
+            <div class="ops-form">
+              <label data-i18n-label="deployment.stack">
+                <span data-i18n="deployment.stack">Runtime Stack</span>
+                <select id="liveStackPath"></select>
+              </label>
+              <label data-i18n-label="deployment.totalBudget">
+                <span data-i18n="deployment.totalBudget">Total Budget (USDT)</span>
+                <input id="deploymentTotalBudget" value="0" />
+              </label>
+              <div id="deploymentProfiles"></div>
+              <div class="ops-row">
+                <button type="button" onclick="applySuggestedBudgets()" data-i18n="deployment.useSuggested">Use Historical Defaults</button>
+                <button type="button" onclick="startLiveDeployment()" data-i18n="deployment.start">Start Daemon</button>
+                <button type="button" onclick="stopLiveDeployment()" data-i18n="deployment.stop">Stop Stack</button>
+              </div>
+              <div class="subtle" id="deploymentHint" data-i18n="deployment.hint">Each budget is editable. The default suggestion is computed from recent historical replay for the profile when possible.</div>
+            </div>
+          </article>
+          <article class="ops-card" id="liveOverviewPanel"></article>
+        </div>
+      </section>
+
+      <section class="panel wide" data-panel="live">
+        <div class="toolbar">
+          <h2 data-i18n="liveCharts.title">Live Strategy Charts</h2>
+          <div class="subtle" data-i18n="liveCharts.subtitle">The chart stays as a blank coordinate frame until a daemon is running. Once started, each profile begins monitoring and the curve starts plotting live points.</div>
         </div>
         <div class="chart-grid" id="strategyChartList"></div>
       </section>
 
-      <section class="panel wide">
+      <section class="panel wide" data-panel="research">
         <div class="toolbar">
-          <h2>Strategy Lab</h2>
-          <div class="subtle" id="researchStatus">No strategy scan has been run from the dashboard yet.</div>
+          <h2 data-i18n="research.title">Strategy Lab</h2>
+          <div class="subtle" id="researchStatus" data-i18n="research.statusEmpty">No strategy scan has been run from the dashboard yet.</div>
         </div>
         <div class="research-layout">
           <article class="research-block">
-            <h3>Research Scan</h3>
+            <h3 data-i18n="research.scan">Research Scan</h3>
             <div class="ops-form">
-              <label>Market
+              <label>
+                <span data-i18n="research.market">Market</span>
                 <select id="researchMarket">
                   <option value="spot">spot</option>
                   <option value="futures">futures</option>
                 </select>
               </label>
-              <label>Universe
+              <label>
+                <span data-i18n="research.universe">Universe</span>
                 <select id="researchCategory"></select>
               </label>
-              <label>Symbol
+              <label>
+                <span data-i18n="research.symbol">Symbol</span>
                 <input id="researchSymbol" value="BTCUSDT" />
               </label>
-              <label>Interval
+              <label>
+                <span data-i18n="research.interval">Interval</span>
                 <input id="researchInterval" value="15m" />
               </label>
-              <label>Bars
+              <label>
+                <span data-i18n="research.bars">Bars</span>
                 <input id="researchBars" value="1500" />
               </label>
-              <label>Budget
+              <label>
+                <span data-i18n="research.budget">Budget</span>
                 <input id="researchCapital" value="1000" />
               </label>
-              <label>Allocation Mode
+              <label>
+                <span data-i18n="research.allocationMode">Allocation Mode</span>
                 <select id="researchAllocationMode">
                   <option value="auto">auto from history</option>
                   <option value="manual">manual weights</option>
                 </select>
               </label>
-              <label>Manual Weights
+              <label>
+                <span data-i18n="research.manualWeights">Manual Weights</span>
                 <input id="researchManualWeights" value="" placeholder="sma_crossover=40, rsi_regime=35, ichimoku_trend=25" />
               </label>
-              <label>Fee (bps)
+              <label>
+                <span data-i18n="research.fee">Fee (bps)</span>
                 <input id="researchFeeBps" value="10" />
               </label>
-              <label>Slippage (bps)
+              <label>
+                <span data-i18n="research.slippage">Slippage (bps)</span>
                 <input id="researchSlippageBps" value="2" />
               </label>
-              <label>Leverage
+              <label>
+                <span data-i18n="research.leverage">Leverage</span>
                 <input id="researchLeverage" value="1" />
               </label>
-              <label>Position Fraction
+              <label>
+                <span data-i18n="research.positionFraction">Position Fraction</span>
                 <input id="researchPositionFraction" value="1" />
               </label>
               <div class="ops-row">
-                <button type="button" onclick="runResearchScan()">Run Strategy Scan</button>
+                <button type="button" onclick="runResearchScan()" data-i18n="research.run">Run Strategy Scan</button>
               </div>
               <div class="subtle" id="intervalHint">15m means each K-line covers 15 minutes. Increase Bars to simulate a longer period.</div>
             </div>
@@ -2023,136 +2738,151 @@ DASHBOARD_TEMPLATE = """<!doctype html>
         </div>
       </section>
 
-      <section class="panel">
+      <section class="panel" data-panel="live">
         <div class="toolbar">
-          <h2>Portfolio</h2>
+          <h2 data-i18n="portfolio.title">Portfolio</h2>
           <div class="subtle" id="portfolioTime"></div>
         </div>
         <div id="portfolioPanel"></div>
       </section>
 
-      <section class="panel wide">
+      <section class="panel wide" data-panel="live">
         <div class="toolbar">
-          <h2>Operations</h2>
-          <div class="subtle">Local control plane with explicit white-listed actions</div>
+          <h2 data-i18n="advanced.title">Advanced Operations</h2>
+          <div class="subtle" data-i18n="advanced.subtitle">Manual runtime controls and wallet actions are still available here, but the primary workflow lives in the Live Deployment panel.</div>
         </div>
-        <div class="ops-grid">
+        <details class="advanced-details">
+          <summary data-i18n="advanced.open">Open advanced runtime controls</summary>
+          <div class="ops-grid" style="margin-top:18px">
           <article class="ops-card">
-            <h3>Stack Control</h3>
+            <h3 data-i18n="advanced.stackControl">Stack Control</h3>
             <div class="ops-form">
-              <label>Runtime Stack
+              <label>
+                <span data-i18n="deployment.stack">Runtime Stack</span>
                 <select id="stackPath"></select>
               </label>
               <div class="ops-row">
-                <button type="button" onclick="runStackAction('start_stack')">Start Stack</button>
-                <button type="button" onclick="runStackAction('stop_stack')">Stop Stack</button>
-                <button type="button" onclick="runStackAction('doctor_stack')">Doctor Stack</button>
+                <button type="button" onclick="runStackAction('start_stack')" data-i18n="advanced.startStack">Start Stack</button>
+                <button type="button" onclick="runStackAction('stop_stack')" data-i18n="advanced.stopStack">Stop Stack</button>
+                <button type="button" onclick="runStackAction('doctor_stack')" data-i18n="advanced.doctorStack">Doctor Stack</button>
               </div>
             </div>
           </article>
 
           <article class="ops-card">
-            <h3>Profile Control</h3>
+            <h3 data-i18n="advanced.profileControl">Profile Control</h3>
             <div class="ops-form">
-              <label>Runtime Profile
+              <label>
+                <span data-i18n="advanced.runtimeProfile">Runtime Profile</span>
                 <select id="profilePath"></select>
               </label>
               <div class="ops-row">
-                <button type="button" onclick="runProfileAction('start_profile')">Start Profile</button>
-                <button type="button" onclick="runProfileAction('stop_profile')">Stop Profile</button>
-                <button type="button" onclick="runProfileAction('doctor_profile')">Doctor Profile</button>
+                <button type="button" onclick="runProfileAction('start_profile')" data-i18n="advanced.startProfile">Start Profile</button>
+                <button type="button" onclick="runProfileAction('stop_profile')" data-i18n="advanced.stopProfile">Stop Profile</button>
+                <button type="button" onclick="runProfileAction('doctor_profile')" data-i18n="advanced.doctorProfile">Doctor Profile</button>
               </div>
             </div>
           </article>
 
           <article class="ops-card">
-            <h3>Spot Runtime Ops</h3>
+            <h3 data-i18n="advanced.spotOps">Spot Runtime Ops</h3>
             <div class="ops-form">
-              <label>Symbol
+              <label>
+                <span data-i18n="research.symbol">Symbol</span>
                 <input id="reconcileSymbol" value="BTCUSDT" />
               </label>
               <div class="ops-row">
-                <button type="button" onclick="reconcileSpot()">Reconcile Spot</button>
-                <button type="button" onclick="refreshPortfolio()">Refresh Portfolio Hint</button>
+                <button type="button" onclick="reconcileSpot()" data-i18n="advanced.reconcileSpot">Reconcile Spot</button>
+                <button type="button" onclick="refreshPortfolio()" data-i18n="advanced.refreshPortfolio">Refresh Portfolio Hint</button>
               </div>
             </div>
           </article>
 
           <article class="ops-card">
-            <h3>Manual Spot Order</h3>
+            <h3 data-i18n="advanced.manualOrder">Manual Spot Order</h3>
             <div class="ops-form">
-              <label>Symbol
+              <label>
+                <span data-i18n="research.symbol">Symbol</span>
                 <input id="orderSymbol" value="BTCUSDT" />
               </label>
-              <label>Submission Mode
+              <label>
+                <span data-i18n="advanced.submissionMode">Submission Mode</span>
                 <select id="orderMode">
                   <option value="DRY_RUN">DRY_RUN</option>
                   <option value="TEST">TEST</option>
                   <option value="LIVE">LIVE</option>
                 </select>
               </label>
-              <label>Buy Quote Qty
+              <label>
+                <span data-i18n="advanced.buyQuoteQty">Buy Quote Qty</span>
                 <input id="buyQuoteQty" value="25" />
               </label>
-              <label>Sell Quantity
+              <label>
+                <span data-i18n="advanced.sellQuantity">Sell Quantity</span>
                 <input id="sellQuantity" value="0.001" />
               </label>
               <div class="ops-row">
-                <button type="button" onclick="buySpotMarket()">Buy Market</button>
-                <button type="button" onclick="sellSpotMarket()">Sell Market</button>
+                <button type="button" onclick="buySpotMarket()" data-i18n="advanced.buyMarket">Buy Market</button>
+                <button type="button" onclick="sellSpotMarket()" data-i18n="advanced.sellMarket">Sell Market</button>
               </div>
             </div>
           </article>
 
           <article class="ops-card">
-            <h3>Earn to Spot</h3>
+            <h3 data-i18n="advanced.earnToSpot">Earn to Spot</h3>
             <div class="ops-form">
-              <label>Asset
+              <label>
+                <span data-i18n="advanced.asset">Asset</span>
                 <input id="redeemAsset" value="USDT" />
               </label>
-              <label>Amount
+              <label>
+                <span data-i18n="advanced.amount">Amount</span>
                 <input id="redeemAmount" value="100" />
               </label>
-              <label>Product Id (optional)
+              <label>
+                <span data-i18n="advanced.productId">Product Id (optional)</span>
                 <input id="redeemProductId" value="" placeholder="auto-resolve from flexible position" />
               </label>
-              <label>Destination
+              <label>
+                <span data-i18n="advanced.destination">Destination</span>
                 <input id="redeemDestAccount" value="SPOT" />
               </label>
-              <label>Confirm Phrase
+              <label>
+                <span data-i18n="advanced.confirmPhrase">Confirm Phrase</span>
                 <input id="redeemConfirmText" value="" placeholder='type REDEEM to execute' />
               </label>
               <div class="ops-row">
-                <button type="button" onclick="redeemEarnFlexible()">Redeem Flexible</button>
+                <button type="button" onclick="redeemEarnFlexible()" data-i18n="advanced.redeemFlexible">Redeem Flexible</button>
               </div>
-              <div class="subtle">This is a real wallet action on mainnet. Enter <code>REDEEM</code> exactly to allow it.</div>
+              <div class="subtle" data-i18n="advanced.redeemHint">This is a real wallet action on mainnet. Enter <code>REDEEM</code> exactly to allow it.</div>
             </div>
           </article>
-        </div>
-        <div class="response-box" id="actionResponse"><h3>Action Center</h3><div class="subtle">No control action executed yet.</div></div>
+          </div>
+          <div class="response-box" id="actionResponse"><h3 data-i18n="advanced.actionCenter">Action Center</h3><div class="subtle" data-i18n="advanced.actionEmpty">No control action executed yet.</div></div>
+        </details>
       </section>
 
-      <section class="panel wide">
+      <section class="panel wide" data-panel="live">
         <div class="toolbar">
-          <h2>Recent Orders</h2>
-          <div class="subtle">Newest first</div>
+          <h2 data-i18n="orders.title">Recent Orders</h2>
+          <div class="subtle" data-i18n="orders.subtitle">Newest first</div>
         </div>
         <div id="ordersPanel"></div>
       </section>
 
-      <section class="panel wide">
+      <section class="panel wide" data-panel="live">
         <div class="split">
           <div>
             <div class="toolbar">
-              <h2>Recent Events</h2>
-              <div class="subtle">User stream and reconciler activity</div>
+              <h2 data-i18n="events.title">Recent Events</h2>
+              <div class="subtle" data-i18n="events.subtitle">User stream and reconciler activity</div>
             </div>
             <div id="eventsPanel"></div>
           </div>
           <div>
             <div class="toolbar">
-              <h2>Runtime Files</h2>
-              <div class="subtle">Mirrored JSON heartbeat files</div>
+              <h2 data-i18n="files.title">Runtime Files</h2>
+              <div class="subtle" data-i18n="files.subtitle">Mirrored JSON heartbeat files</div>
             </div>
             <div class="list" id="runtimeFiles"></div>
           </div>
@@ -2164,7 +2894,252 @@ DASHBOARD_TEMPLATE = """<!doctype html>
   <script>
     const REFRESH_SECONDS = __REFRESH_SECONDS__;
     let currentControls = null;
+    let currentSnapshot = null;
+    let currentLocale = window.localStorage.getItem("dashboardLocale") || "en";
+    let currentPanel = window.localStorage.getItem("dashboardPanel") || "live";
+    let deploymentDraft = { stackPath: null, totalBudget: null, profileBudgets: {} };
     const sectionHashes = {};
+    const I18N = {
+      en: {
+        "hero.eyebrow": "BinanceTrade Runtime",
+        "hero.title": "Local Ops Dashboard",
+        "hero.copy": "A two-panel workspace for research and live trading. Configure a deployable budget, launch a daemon, and watch strategy curves, metrics, and actions update from the same local state.",
+        "tabs.live": "Live Console",
+        "tabs.research": "Research Lab",
+        "stacks.title": "Stacks",
+        "services.title": "Services",
+        "services.subtitle": "Daemon members and latest heartbeat",
+        "deployment.title": "Live Deployment",
+        "deployment.subtitle": "Choose a stack, review the historical budget suggestion for each strategy, then start the daemon.",
+        "deployment.plan": "Deployment Plan",
+        "deployment.stack": "Runtime Stack",
+        "deployment.totalBudget": "Total Budget (USDT)",
+        "deployment.useSuggested": "Use Historical Defaults",
+        "deployment.start": "Start Daemon",
+        "deployment.stop": "Stop Stack",
+        "deployment.hint": "Each budget is editable. The default suggestion is computed from recent historical replay for the profile when possible.",
+        "liveCharts.title": "Live Strategy Charts",
+        "liveCharts.subtitle": "The chart stays as a blank coordinate frame until a daemon is running. Once started, each profile begins monitoring and the curve starts plotting live points.",
+        "research.title": "Strategy Lab",
+        "research.statusEmpty": "No strategy scan has been run from the dashboard yet.",
+        "research.scan": "Research Scan",
+        "research.market": "Market",
+        "research.universe": "Universe",
+        "research.symbol": "Symbol",
+        "research.interval": "Interval",
+        "research.bars": "Bars",
+        "research.budget": "Budget",
+        "research.allocationMode": "Allocation Mode",
+        "research.manualWeights": "Manual Weights",
+        "research.fee": "Fee (bps)",
+        "research.slippage": "Slippage (bps)",
+        "research.leverage": "Leverage",
+        "research.positionFraction": "Position Fraction",
+        "research.run": "Run Strategy Scan",
+        "research.generateStack": "Generate Deployable Stack",
+        "research.generatedStack": "Latest generated stack",
+        "portfolio.title": "Portfolio",
+        "advanced.title": "Advanced Operations",
+        "advanced.subtitle": "Manual runtime controls and wallet actions are still available here, but the primary workflow lives in the Live Deployment panel.",
+        "advanced.open": "Open advanced runtime controls",
+        "advanced.stackControl": "Stack Control",
+        "advanced.profileControl": "Profile Control",
+        "advanced.runtimeProfile": "Runtime Profile",
+        "advanced.startStack": "Start Stack",
+        "advanced.stopStack": "Stop Stack",
+        "advanced.doctorStack": "Doctor Stack",
+        "advanced.startProfile": "Start Profile",
+        "advanced.stopProfile": "Stop Profile",
+        "advanced.doctorProfile": "Doctor Profile",
+        "advanced.spotOps": "Spot Runtime Ops",
+        "advanced.reconcileSpot": "Reconcile Spot",
+        "advanced.refreshPortfolio": "Refresh Portfolio Hint",
+        "advanced.manualOrder": "Manual Spot Order",
+        "advanced.submissionMode": "Submission Mode",
+        "advanced.buyQuoteQty": "Buy Quote Qty",
+        "advanced.sellQuantity": "Sell Quantity",
+        "advanced.buyMarket": "Buy Market",
+        "advanced.sellMarket": "Sell Market",
+        "advanced.earnToSpot": "Earn to Spot",
+        "advanced.asset": "Asset",
+        "advanced.amount": "Amount",
+        "advanced.productId": "Product Id (optional)",
+        "advanced.destination": "Destination",
+        "advanced.confirmPhrase": "Confirm Phrase",
+        "advanced.redeemFlexible": "Redeem Flexible",
+        "advanced.redeemHint": "This is a real wallet action on mainnet. Enter REDEEM exactly to allow it.",
+        "advanced.actionCenter": "Action Center",
+        "advanced.actionEmpty": "No control action executed yet.",
+        "orders.title": "Recent Orders",
+        "orders.subtitle": "Newest first",
+        "events.title": "Recent Events",
+        "events.subtitle": "User stream and reconciler activity",
+        "files.title": "Runtime Files",
+        "files.subtitle": "Mirrored JSON heartbeat files",
+        "live.placeholder": "Waiting for daemon start. This chart will begin plotting once the strategy is monitoring live data.",
+        "live.activity": "Recent Strategy Actions",
+        "live.overview": "Live Launch Summary",
+        "live.overview.copy": "Use this view to budget each strategy, watch daemon health, and keep the active budget close to your spot balance.",
+        "live.stackStatus": "Stack Status",
+        "live.serviceCount": "Profiles",
+        "live.spotBudget": "Spot Budget",
+        "live.liveProfiles": "Live Profiles",
+        "live.planBudget": "Planned Budget",
+        "live.historicalWeight": "Historical Weight",
+        "live.historyBasis": "Historical Basis",
+        "live.interval": "Interval",
+        "live.lastPrice": "Last Price",
+        "live.position": "Position",
+        "live.pendingOrder": "Pending Order",
+        "live.lastUpdate": "Last Update",
+        "live.state": "State",
+        "live.noActivity": "No recent live actions yet. Start the daemon and wait for the next signal.",
+        "live.mode": "Mode",
+        "live.bars": "Bars",
+        "live.chartRangeHigh": "Chart Max",
+        "live.chartRangeMid": "Chart Mid",
+        "live.chartRangeLow": "Chart Min",
+        "live.lastCloseTime": "Last Close Time",
+      },
+      zh: {
+        "hero.eyebrow": "BinanceTrade 运行时",
+        "hero.title": "本地交易控制台",
+        "hero.copy": "把研究和实盘运行放在同一工作台里：先配置预算，再启动 daemon，然后观察策略曲线、指标和操作记录如何沿着同一份本地状态实时更新。",
+        "tabs.live": "实时看板",
+        "tabs.research": "研究实验室",
+        "stacks.title": "组合栈",
+        "services.title": "策略实例",
+        "services.subtitle": "daemon 成员与最近心跳",
+        "deployment.title": "实时部署",
+        "deployment.subtitle": "先选择 stack，再查看每个策略的历史预算建议，然后一键启动 daemon。",
+        "deployment.plan": "部署方案",
+        "deployment.stack": "运行栈",
+        "deployment.totalBudget": "总预算（USDT）",
+        "deployment.useSuggested": "使用历史建议",
+        "deployment.start": "启动 Daemon",
+        "deployment.stop": "停止 Stack",
+        "deployment.hint": "每个策略额度都可以手动调整；默认建议会尽量根据该 profile 的近期历史回放自动生成。",
+        "liveCharts.title": "实时策略曲线",
+        "liveCharts.subtitle": "启动前这里会显示空白坐标图。启动 daemon 后，每个策略开始监控，曲线会随着实时状态逐步打点。",
+        "research.title": "策略实验室",
+        "research.statusEmpty": "还没有从 dashboard 发起过策略扫描。",
+        "research.scan": "研究扫描",
+        "research.market": "市场",
+        "research.universe": "策略集合",
+        "research.symbol": "交易对",
+        "research.interval": "周期",
+        "research.bars": "K 线数量",
+        "research.budget": "预算",
+        "research.allocationMode": "分配方式",
+        "research.manualWeights": "手动权重",
+        "research.fee": "手续费（bps）",
+        "research.slippage": "滑点（bps）",
+        "research.leverage": "杠杆",
+        "research.positionFraction": "仓位比例",
+        "research.run": "运行策略扫描",
+        "research.generateStack": "生成可部署 Stack",
+        "research.generatedStack": "最近生成的 Stack",
+        "portfolio.title": "资产总览",
+        "advanced.title": "高级操作",
+        "advanced.subtitle": "手动运行控制、钱包划转和临时下单仍然保留在这里，但日常主流程应该放在上面的实时部署面板。",
+        "advanced.open": "展开高级运行控制",
+        "advanced.stackControl": "Stack 控制",
+        "advanced.profileControl": "Profile 控制",
+        "advanced.runtimeProfile": "运行 Profile",
+        "advanced.startStack": "启动 Stack",
+        "advanced.stopStack": "停止 Stack",
+        "advanced.doctorStack": "体检 Stack",
+        "advanced.startProfile": "启动 Profile",
+        "advanced.stopProfile": "停止 Profile",
+        "advanced.doctorProfile": "体检 Profile",
+        "advanced.spotOps": "现货运行维护",
+        "advanced.reconcileSpot": "现货对账",
+        "advanced.refreshPortfolio": "刷新资产提示",
+        "advanced.manualOrder": "手动现货下单",
+        "advanced.submissionMode": "提交模式",
+        "advanced.buyQuoteQty": "买入金额",
+        "advanced.sellQuantity": "卖出数量",
+        "advanced.buyMarket": "市价买入",
+        "advanced.sellMarket": "市价卖出",
+        "advanced.earnToSpot": "理财转现货",
+        "advanced.asset": "资产",
+        "advanced.amount": "数量",
+        "advanced.productId": "产品 ID（可选）",
+        "advanced.destination": "目标账户",
+        "advanced.confirmPhrase": "确认短语",
+        "advanced.redeemFlexible": "赎回活期",
+        "advanced.redeemHint": "这是主网真实钱包动作。只有完整输入 REDEEM 才会放行。",
+        "advanced.actionCenter": "操作反馈",
+        "advanced.actionEmpty": "还没有执行任何控制动作。",
+        "orders.title": "最近订单",
+        "orders.subtitle": "最新记录优先",
+        "events.title": "最近事件",
+        "events.subtitle": "用户流与对账活动",
+        "files.title": "运行时文件",
+        "files.subtitle": "镜像心跳 JSON 文件",
+        "live.placeholder": "等待启动 daemon。策略一旦进入实时监控，这张图就会开始打点。",
+        "live.activity": "最近策略动作",
+        "live.overview": "实时部署摘要",
+        "live.overview.copy": "在这里设置每个策略预算、查看 daemon 健康状态，并让计划预算与现货余额保持一致。",
+        "live.stackStatus": "Stack 状态",
+        "live.serviceCount": "策略数量",
+        "live.spotBudget": "现货预算",
+        "live.liveProfiles": "LIVE Profile 数",
+        "live.planBudget": "计划额度",
+        "live.historicalWeight": "历史建议权重",
+        "live.historyBasis": "历史依据",
+        "live.interval": "周期",
+        "live.lastPrice": "最新价格",
+        "live.position": "当前仓位",
+        "live.pendingOrder": "待处理订单",
+        "live.lastUpdate": "最近更新时间",
+        "live.state": "状态",
+        "live.noActivity": "暂时还没有实时操作记录。启动 daemon 后等待下一个信号即可。",
+        "live.mode": "模式",
+        "live.bars": "K 线数",
+        "live.chartRangeHigh": "图上沿",
+        "live.chartRangeMid": "图中位",
+        "live.chartRangeLow": "图下沿",
+        "live.lastCloseTime": "最近收盘时间",
+      },
+    };
+
+    function t(key) {
+      return (I18N[currentLocale] && I18N[currentLocale][key]) || I18N.en[key] || key;
+    }
+
+    function switchPanel(panel) {
+      currentPanel = panel === "research" ? "research" : "live";
+      window.localStorage.setItem("dashboardPanel", currentPanel);
+      document.querySelectorAll("[data-panel]").forEach((node) => {
+        node.classList.toggle("is-hidden", node.dataset.panel !== currentPanel);
+      });
+      document.getElementById("tabLive").classList.toggle("active", currentPanel === "live");
+      document.getElementById("tabResearch").classList.toggle("active", currentPanel === "research");
+    }
+
+    function applyStaticTranslations() {
+      document.querySelectorAll("[data-i18n]").forEach((node) => {
+        node.innerHTML = escapeHtml(t(node.dataset.i18n)).replaceAll("&lt;code&gt;", "<code>").replaceAll("&lt;/code&gt;", "</code>");
+      });
+      const toggle = document.getElementById("langToggle");
+      if (toggle) toggle.textContent = currentLocale === "en" ? "中文" : "EN";
+    }
+
+    function setLocale(locale) {
+      currentLocale = locale === "zh" ? "zh" : "en";
+      window.localStorage.setItem("dashboardLocale", currentLocale);
+      applyStaticTranslations();
+      if (currentSnapshot) {
+        renderCurrentSnapshot(currentSnapshot, { force: true });
+      } else {
+        switchPanel(currentPanel);
+      }
+    }
+
+    function toggleLocale() {
+      setLocale(currentLocale === "en" ? "zh" : "en");
+    }
 
     function escapeHtml(value) {
       return String(value ?? "")
@@ -2185,9 +3160,10 @@ DASHBOARD_TEMPLATE = """<!doctype html>
     function formatNumber(value) {
       const numeric = Number(value);
       if (!Number.isFinite(numeric)) return "—";
-      if (Math.abs(numeric) >= 1000) return numeric.toLocaleString(undefined, { maximumFractionDigits: 2 });
-      if (Math.abs(numeric) >= 1) return numeric.toLocaleString(undefined, { maximumFractionDigits: 4 });
-      return numeric.toLocaleString(undefined, { maximumFractionDigits: 8 });
+      const locale = currentLocale === "zh" ? "zh-CN" : "en-US";
+      if (Math.abs(numeric) >= 1000) return numeric.toLocaleString(locale, { maximumFractionDigits: 2 });
+      if (Math.abs(numeric) >= 1) return numeric.toLocaleString(locale, { maximumFractionDigits: 4 });
+      return numeric.toLocaleString(locale, { maximumFractionDigits: 8 });
     }
 
     function formatPercent(value) {
@@ -2199,13 +3175,15 @@ DASHBOARD_TEMPLATE = """<!doctype html>
     function formatMoney(value) {
       const numeric = Number(value);
       if (!Number.isFinite(numeric)) return "—";
-      return `$${numeric.toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
+      const locale = currentLocale === "zh" ? "zh-CN" : "en-US";
+      return `$${numeric.toLocaleString(locale, { maximumFractionDigits: 2 })}`;
     }
 
     function formatTime(value) {
       const numeric = Number(value);
       if (!Number.isFinite(numeric) || numeric <= 0) return "—";
-      return new Date(numeric).toLocaleString();
+      const locale = currentLocale === "zh" ? "zh-CN" : "en-US";
+      return new Date(numeric).toLocaleString(locale);
     }
 
     function lastValue(values) {
@@ -2251,10 +3229,10 @@ DASHBOARD_TEMPLATE = """<!doctype html>
 
     function renderSummary(summary) {
       document.getElementById("summaryGrid").innerHTML = [
-        metric("Stacks", `${summary.healthy_stack_count}/${summary.stack_count}`, "Healthy stack supervisors"),
-        metric("Services", `${summary.healthy_service_count}/${summary.service_count}`, "Healthy daemon members"),
-        metric("Orders", `${summary.open_order_count}/${summary.order_count}`, "Open among most recent tracked orders"),
-        metric("Events", `${summary.event_count}`, "Newest event records in local state"),
+        metric(t("stacks.title"), `${summary.healthy_stack_count}/${summary.stack_count}`, t("services.subtitle")),
+        metric(t("services.title"), `${summary.healthy_service_count}/${summary.service_count}`, t("services.subtitle")),
+        metric(t("orders.title"), `${summary.open_order_count}/${summary.order_count}`, t("orders.subtitle")),
+        metric(t("events.title"), `${summary.event_count}`, t("events.subtitle")),
       ].join("");
     }
 
@@ -2274,14 +3252,155 @@ DASHBOARD_TEMPLATE = """<!doctype html>
       currentControls = controls;
       if (!controls) return;
       setOptions("stackPath", controls.available_stacks || []);
+      setOptions("liveStackPath", controls.available_stacks || []);
       setOptions("profilePath", controls.available_profiles || []);
       setOptions("researchCategory", controls.research_categories || [], "key", "label");
+      if (!deploymentDraft.stackPath) {
+        deploymentDraft.stackPath = document.getElementById("liveStackPath")?.value || controls.available_stacks?.[0]?.path || null;
+      }
+      const liveStack = document.getElementById("liveStackPath");
+      if (liveStack && deploymentDraft.stackPath) {
+        liveStack.value = deploymentDraft.stackPath;
+      }
+    }
+
+    function selectedStack(deployment) {
+      const stacks = deployment?.stacks || [];
+      if (!stacks.length) return null;
+      const selectedPath = deploymentDraft.stackPath || deployment.default_stack_path || stacks[0].path;
+      return stacks.find((item) => item.path === selectedPath) || stacks[0];
+    }
+
+    function applySuggestedBudgets() {
+      if (!currentSnapshot?.deployment?.enabled) return;
+      const deployment = currentSnapshot.deployment;
+      const stack = selectedStack(deployment);
+      if (!stack) return;
+      const totalBudgetNode = document.getElementById("deploymentTotalBudget");
+      const totalBudget = Number(totalBudgetNode?.value || deployment.default_total_budget || 0);
+      deploymentDraft.totalBudget = totalBudget;
+      deploymentDraft.profileBudgets = {};
+      stack.profiles.forEach((profile) => {
+        const suggested = (Number(profile.suggested_weight_pct || 0) / 100) * totalBudget;
+        deploymentDraft.profileBudgets[profile.name] = Number.isFinite(suggested) ? suggested : Number(profile.current_budget || 0);
+      });
+      renderLiveWorkspace(currentSnapshot);
+    }
+
+    function updateDeploymentBudget(name, value) {
+      deploymentDraft.profileBudgets[name] = Number(value || 0);
+    }
+
+    function blankChartSvg(width, height, padX, padY) {
+      const topY = padY;
+      const midY = height / 2;
+      const bottomY = height - padY;
+      return `
+        <svg class="chart-svg" viewBox="0 0 ${width} ${height}" role="img" aria-label="blank live chart">
+          <line x1="${padX}" y1="${topY}" x2="${width - padX}" y2="${topY}" stroke="rgba(23,22,26,0.08)" stroke-width="1" />
+          <line x1="${padX}" y1="${midY}" x2="${width - padX}" y2="${midY}" stroke="rgba(23,22,26,0.10)" stroke-width="1" stroke-dasharray="4 6" />
+          <line x1="${padX}" y1="${bottomY}" x2="${width - padX}" y2="${bottomY}" stroke="rgba(23,22,26,0.08)" stroke-width="1" />
+          <line x1="${padX}" y1="${topY}" x2="${padX}" y2="${bottomY}" stroke="rgba(23,22,26,0.08)" stroke-width="1" />
+        </svg>
+        <div class="chart-empty-copy">${escapeHtml(t("live.placeholder"))}</div>
+      `;
+    }
+
+    function renderLiveOverview(deployment, stack) {
+      const node = document.getElementById("liveOverviewPanel");
+      if (!node) return;
+      if (!deployment?.enabled || !stack) {
+        node.innerHTML = `<h3>${escapeHtml(t("live.overview"))}</h3><div class="subtle">${escapeHtml(t("live.noActivity"))}</div>`;
+        return;
+      }
+      const runningProfiles = stack.profiles.filter((item) => item.status === "RUNNING").length;
+      const liveProfiles = stack.profiles.filter((item) => item.submission_mode === "LIVE").length;
+      node.innerHTML = `
+        <h3>${escapeHtml(t("live.overview"))}</h3>
+        <div class="subtle" style="margin-bottom:12px">${escapeHtml(t("live.overview.copy"))}</div>
+        <div class="live-overview-grid">
+          <div class="mini-metric"><span>${escapeHtml(t("live.stackStatus"))}</span><strong>${escapeHtml(stack.name)}</strong></div>
+          <div class="mini-metric"><span>${escapeHtml(t("live.serviceCount"))}</span><strong>${escapeHtml(stack.profile_count)}</strong></div>
+          <div class="mini-metric"><span>${escapeHtml(t("live.spotBudget"))}</span><strong>${escapeHtml(formatMoney(deploymentDraft.totalBudget ?? deployment.default_total_budget ?? 0))}</strong></div>
+          <div class="mini-metric"><span>${escapeHtml(t("live.liveProfiles"))}</span><strong>${escapeHtml(`${liveProfiles}/${runningProfiles}`)}</strong></div>
+        </div>
+      `;
+    }
+
+    function renderLiveWorkspace(snapshot) {
+      const deployment = snapshot?.deployment;
+      const charts = snapshot?.strategy_charts || [];
+      const chartNode = document.getElementById("strategyChartList");
+      const planNode = document.getElementById("deploymentProfiles");
+      if (!chartNode || !planNode) return;
+      if (!deployment?.enabled) {
+        planNode.innerHTML = `<div class="empty">${escapeHtml(t("live.noActivity"))}</div>`;
+        chartNode.innerHTML = `<div class="empty">${escapeHtml(t("live.placeholder"))}</div>`;
+        return;
+      }
+
+      const stack = selectedStack(deployment);
+      if (!stack) {
+        planNode.innerHTML = `<div class="empty">${escapeHtml(t("live.noActivity"))}</div>`;
+        chartNode.innerHTML = `<div class="empty">${escapeHtml(t("live.placeholder"))}</div>`;
+        return;
+      }
+
+      if (deploymentDraft.stackPath !== stack.path) {
+        deploymentDraft.stackPath = stack.path;
+      }
+      if (deploymentDraft.totalBudget === null || !Number.isFinite(Number(deploymentDraft.totalBudget))) {
+        deploymentDraft.totalBudget = Number(deployment.default_total_budget || 0);
+      }
+      if (!Object.keys(deploymentDraft.profileBudgets || {}).length) {
+        stack.profiles.forEach((profile) => {
+          deploymentDraft.profileBudgets[profile.name] = Number(profile.suggested_budget || profile.current_budget || 0);
+        });
+      }
+
+      const totalBudgetInput = document.getElementById("deploymentTotalBudget");
+      if (totalBudgetInput && document.activeElement !== totalBudgetInput) {
+        totalBudgetInput.value = String(deploymentDraft.totalBudget ?? deployment.default_total_budget ?? 0);
+      }
+      const deploymentStatus = document.getElementById("deploymentStatus");
+      if (deploymentStatus) {
+        deploymentStatus.textContent = `${stack.name} · ${stack.profile_count} profiles`;
+      }
+
+      planNode.innerHTML = `
+        <div class="deployment-profile-grid">
+          ${stack.profiles.map((profile) => `
+            <article class="deployment-profile-row">
+              <div class="deployment-profile-head">
+                <div>
+                  <strong>${escapeHtml(profile.name)}</strong>
+                  <div class="subtle">${escapeHtml(profile.symbol || "—")} · ${escapeHtml(profile.interval || "—")} · ${escapeHtml(profile.strategy_label || "strategy")}</div>
+                </div>
+                <span class="${pillClass(profile.status || "STOPPED", profile.status === "RUNNING")}">${escapeHtml(profile.status || "STOPPED")}</span>
+              </div>
+              <label>
+                <span>${escapeHtml(t("live.planBudget"))}</span>
+                <input value="${escapeHtml(formatNumber(deploymentDraft.profileBudgets[profile.name] ?? profile.suggested_budget ?? 0))}" oninput="updateDeploymentBudget('${escapeHtml(profile.name)}', this.value)" />
+              </label>
+              <div class="deployment-profile-meta">
+                <div><span>${escapeHtml(t("live.historicalWeight"))}</span>${escapeHtml(formatPercent(profile.suggested_weight_pct))}</div>
+                <div><span>${escapeHtml(t("live.mode"))}</span>${escapeHtml(profile.submission_mode || "PLANNED")}</div>
+              </div>
+              <div class="subtle" style="margin-top:8px">${escapeHtml(profile.history_basis || t("live.noActivity"))}</div>
+            </article>
+          `).join("")}
+        </div>
+      `;
+
+      const chartByService = Object.fromEntries(charts.map((item) => [item.service_name, item]));
+      chartNode.innerHTML = stack.profiles.map((profile) => renderLiveStrategyCard(profile, chartByService[profile.name])).join("");
+      renderLiveOverview(deployment, stack);
     }
 
     function renderStacks(stacks) {
       const node = document.getElementById("stackList");
       if (!stacks.length) {
-        node.innerHTML = `<div class="empty">No runtime stacks have written state yet.</div>`;
+        node.innerHTML = `<div class="empty">${escapeHtml(t("live.noActivity"))}</div>`;
         return;
       }
       node.innerHTML = stacks.map((item) => `
@@ -2295,7 +3414,7 @@ DASHBOARD_TEMPLATE = """<!doctype html>
           </div>
           <div class="meta-grid">
             <div><span>Started</span>${escapeHtml(item.started_at)}</div>
-            <div><span>Updated</span>${escapeHtml(item.updated_at)}</div>
+            <div><span>${escapeHtml(t("live.lastUpdate"))}</span>${escapeHtml(item.updated_at)}</div>
             <div><span>Heartbeat</span>${escapeHtml(item.last_heartbeat_at)}</div>
             <div><span>Reason</span>${escapeHtml(item.reason || item.error || "—")}</div>
           </div>
@@ -2318,7 +3437,7 @@ DASHBOARD_TEMPLATE = """<!doctype html>
     function renderServices(services) {
       const node = document.getElementById("serviceList");
       if (!services.length) {
-        node.innerHTML = `<div class="empty">No daemon members have written runtime status yet.</div>`;
+        node.innerHTML = `<div class="empty">${escapeHtml(t("live.noActivity"))}</div>`;
         return;
       }
       node.innerHTML = services.map((item) => `
@@ -2333,79 +3452,111 @@ DASHBOARD_TEMPLATE = """<!doctype html>
           </div>
           <div class="meta-grid">
             <div><span>Strategy</span>${escapeHtml(item.strategy_label)}</div>
-            <div><span>Market</span>${escapeHtml(item.market_type)}</div>
-            <div><span>Symbol</span>${escapeHtml(item.symbol || "—")}</div>
-            <div><span>Interval</span>${escapeHtml(item.interval || "—")}</div>
+            <div><span>${escapeHtml(t("research.market"))}</span>${escapeHtml(item.market_type)}</div>
+            <div><span>${escapeHtml(t("research.symbol"))}</span>${escapeHtml(item.symbol || "—")}</div>
+            <div><span>${escapeHtml(t("live.interval"))}</span>${escapeHtml(item.interval || "—")}</div>
             <div><span>Heartbeat</span>${escapeHtml(item.last_heartbeat_at)}</div>
-            <div><span>Updated</span>${escapeHtml(item.updated_at)}</div>
+            <div><span>${escapeHtml(t("live.lastUpdate"))}</span>${escapeHtml(item.updated_at)}</div>
             <div><span>Actions</span>${escapeHtml(item.actions ?? 0)}</div>
-            <div><span>Position</span>${escapeHtml(item.ctx_state?.position_qty ?? "—")}</div>
-            <div><span>Pending Order</span>${escapeHtml(item.ctx_state?.pending_client_order_id ?? "—")}</div>
+            <div><span>${escapeHtml(t("live.position"))}</span>${escapeHtml(item.ctx_state?.position_qty ?? "—")}</div>
+            <div><span>${escapeHtml(t("live.pendingOrder"))}</span>${escapeHtml(item.ctx_state?.pending_client_order_id ?? "—")}</div>
           </div>
           <div class="subtle" style="margin-top:10px">${escapeHtml(item.reason || item.error || item.strategy_ref || "No runtime errors recorded.")}</div>
         </article>
       `).join("");
     }
 
-    function renderStrategyCharts(charts) {
-      const node = document.getElementById("strategyChartList");
-      if (!charts.length) {
-        node.innerHTML = `<div class="empty">No chartable strategy runtime state is available yet. Start a daemon profile and wait for it to warm up enough K-lines.</div>`;
-        return;
-      }
-      node.innerHTML = charts.map((item) => {
-        const width = 760;
-        const height = 280;
-        const padX = 20;
-        const padY = 18;
-        const minValue = Number(item.chart_min);
-        const maxValue = Number(item.chart_max);
-        const closePoints = polylinePoints(item.series?.close || [], minValue, maxValue, width, height, padX, padY);
-        const fastPoints = polylinePoints(item.series?.fast_ema || [], minValue, maxValue, width, height, padX, padY);
-        const slowPoints = polylinePoints(item.series?.slow_ema || [], minValue, maxValue, width, height, padX, padY);
-        const topY = yGuide(maxValue, minValue, maxValue, height, padY);
-        const midY = yGuide(Number(item.chart_mid), minValue, maxValue, height, padY);
-        const bottomY = yGuide(minValue, minValue, maxValue, height, padY);
-        const signalLabel = item.signal ? item.signal.replaceAll("_", " ") : (item.trend || "neutral");
+    function renderLiveStrategyCard(profile, item) {
+      const width = 760;
+      const height = 280;
+      const padX = 20;
+      const padY = 18;
+      const plannedBudget = deploymentDraft.profileBudgets?.[profile.name] ?? profile.suggested_budget ?? profile.current_budget ?? 0;
+      const activity = profile.activity || [t("live.noActivity")];
+      if (!item) {
         return `
-          <article class="chart-card">
+          <article class="chart-card placeholder">
             <div class="service-head">
               <div class="title-row">
-                <strong>${escapeHtml(item.service_name)}</strong>
-                <span class="${pillClass(item.status, item.healthy)}">${escapeHtml(item.status)}</span>
-                <span class="pill">${escapeHtml(item.symbol || "—")}</span>
-                <span class="pill">${escapeHtml(item.interval || "—")}</span>
+                <strong>${escapeHtml(profile.name)}</strong>
+                <span class="${pillClass("STOPPED", false)}">${escapeHtml(profile.status || "STOPPED")}</span>
+                <span class="pill">${escapeHtml(profile.symbol || "—")}</span>
+                <span class="pill">${escapeHtml(profile.interval || "—")}</span>
               </div>
-              <div class="subtle">${escapeHtml(item.strategy_label)}</div>
+              <div class="subtle">${escapeHtml(profile.strategy_label || "strategy")}</div>
             </div>
-            <div class="chart-wrap">
-              <svg class="chart-svg" viewBox="0 0 ${width} ${height}" role="img" aria-label="${escapeHtml(item.service_name)} chart">
-                <line x1="${padX}" y1="${topY}" x2="${width - padX}" y2="${topY}" stroke="rgba(23,22,26,0.08)" stroke-width="1" />
-                <line x1="${padX}" y1="${midY}" x2="${width - padX}" y2="${midY}" stroke="rgba(23,22,26,0.10)" stroke-width="1" stroke-dasharray="4 6" />
-                <line x1="${padX}" y1="${bottomY}" x2="${width - padX}" y2="${bottomY}" stroke="rgba(23,22,26,0.08)" stroke-width="1" />
-                ${slowPoints ? `<polyline fill="none" stroke="#d39b2a" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" points="${slowPoints}" />` : ""}
-                ${fastPoints ? `<polyline fill="none" stroke="#187d78" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" points="${fastPoints}" />` : ""}
-                <polyline fill="none" stroke="#17161a" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" points="${closePoints}" />
-              </svg>
-            </div>
-            <div class="chart-legend">
-              <span class="legend-key" style="color:#17161a"><span class="legend-line"></span>Close ${escapeHtml(formatNumber(item.last_close))}</span>
-              ${item.fast_period ? `<span class="legend-key" style="color:#187d78"><span class="legend-line"></span>EMA ${escapeHtml(item.fast_period)} ${escapeHtml(formatNumber(lastValue(item.series?.fast_ema)))}</span>` : ""}
-              ${item.slow_period ? `<span class="legend-key" style="color:#d39b2a"><span class="legend-line"></span>EMA ${escapeHtml(item.slow_period)} ${escapeHtml(formatNumber(lastValue(item.series?.slow_ema)))}</span>` : ""}
-            </div>
+            <div class="chart-wrap">${blankChartSvg(width, height, padX, padY)}</div>
             <div class="chart-meta">
-              <div><span>State</span>${escapeHtml(signalLabel)}</div>
-              <div><span>Bars</span>${escapeHtml(item.bar_count)}</div>
-              <div><span>Position</span>${escapeHtml(item.position_qty || "0")}</div>
-              <div><span>Pending Order</span>${escapeHtml(item.pending_client_order_id || "—")}</div>
-              <div><span>Last Close Time</span>${escapeHtml(formatTime(item.last_close_time))}</div>
-              <div><span>Chart Max</span>${escapeHtml(formatNumber(item.chart_max))}</div>
-              <div><span>Chart Mid</span>${escapeHtml(formatNumber(item.chart_mid))}</div>
-              <div><span>Chart Min</span>${escapeHtml(formatNumber(item.chart_min))}</div>
+              <div><span>${escapeHtml(t("live.planBudget"))}</span>${escapeHtml(formatMoney(plannedBudget))}</div>
+              <div><span>${escapeHtml(t("live.historicalWeight"))}</span>${escapeHtml(formatPercent(profile.suggested_weight_pct))}</div>
+              <div><span>${escapeHtml(t("live.state"))}</span>${escapeHtml(profile.status || "PLANNED")}</div>
+              <div><span>${escapeHtml(t("live.mode"))}</span>${escapeHtml(profile.submission_mode || "PLANNED")}</div>
+              <div><span>${escapeHtml(t("live.position"))}</span>0</div>
+              <div><span>${escapeHtml(t("live.pendingOrder"))}</span>—</div>
+              <div><span>${escapeHtml(t("live.lastPrice"))}</span>—</div>
+              <div><span>${escapeHtml(t("live.lastCloseTime"))}</span>—</div>
+            </div>
+            <div class="activity-log">
+              <h4>${escapeHtml(t("live.activity"))}</h4>
+              <ul class="activity-list">${activity.map((row) => `<li>${escapeHtml(row)}</li>`).join("")}</ul>
             </div>
           </article>
         `;
-      }).join("");
+      }
+
+      const minValue = Number(item.chart_min);
+      const maxValue = Number(item.chart_max);
+      const closePoints = polylinePoints(item.series?.close || [], minValue, maxValue, width, height, padX, padY);
+      const fastPoints = polylinePoints(item.series?.fast_ema || [], minValue, maxValue, width, height, padX, padY);
+      const slowPoints = polylinePoints(item.series?.slow_ema || [], minValue, maxValue, width, height, padX, padY);
+      const topY = yGuide(maxValue, minValue, maxValue, height, padY);
+      const midY = yGuide(Number(item.chart_mid), minValue, maxValue, height, padY);
+      const bottomY = yGuide(minValue, minValue, maxValue, height, padY);
+      const signalLabel = item.signal ? item.signal.replaceAll("_", " ") : (item.trend || "neutral");
+      return `
+        <article class="chart-card">
+          <div class="service-head">
+            <div class="title-row">
+              <strong>${escapeHtml(item.service_name)}</strong>
+              <span class="${pillClass(item.status, item.healthy)}">${escapeHtml(item.status)}</span>
+              <span class="pill">${escapeHtml(item.symbol || "—")}</span>
+              <span class="pill">${escapeHtml(item.interval || "—")}</span>
+            </div>
+            <div class="subtle">${escapeHtml(item.strategy_label)}</div>
+          </div>
+          <div class="chart-wrap">
+            <svg class="chart-svg" viewBox="0 0 ${width} ${height}" role="img" aria-label="${escapeHtml(item.service_name)} chart">
+              <line x1="${padX}" y1="${topY}" x2="${width - padX}" y2="${topY}" stroke="rgba(23,22,26,0.08)" stroke-width="1" />
+              <line x1="${padX}" y1="${midY}" x2="${width - padX}" y2="${midY}" stroke="rgba(23,22,26,0.10)" stroke-width="1" stroke-dasharray="4 6" />
+              <line x1="${padX}" y1="${bottomY}" x2="${width - padX}" y2="${bottomY}" stroke="rgba(23,22,26,0.08)" stroke-width="1" />
+              ${slowPoints ? `<polyline fill="none" stroke="#d39b2a" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" points="${slowPoints}" />` : ""}
+              ${fastPoints ? `<polyline fill="none" stroke="#187d78" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" points="${fastPoints}" />` : ""}
+              <polyline fill="none" stroke="#17161a" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" points="${closePoints}" />
+            </svg>
+          </div>
+          <div class="chart-legend">
+            <span class="legend-key" style="color:#17161a"><span class="legend-line"></span>Close ${escapeHtml(formatNumber(item.last_close))}</span>
+            ${item.fast_period ? `<span class="legend-key" style="color:#187d78"><span class="legend-line"></span>EMA ${escapeHtml(item.fast_period)} ${escapeHtml(formatNumber(lastValue(item.series?.fast_ema)))}</span>` : ""}
+            ${item.slow_period ? `<span class="legend-key" style="color:#d39b2a"><span class="legend-line"></span>EMA ${escapeHtml(item.slow_period)} ${escapeHtml(formatNumber(lastValue(item.series?.slow_ema)))}</span>` : ""}
+          </div>
+          <div class="chart-meta">
+            <div><span>${escapeHtml(t("live.planBudget"))}</span>${escapeHtml(formatMoney(plannedBudget))}</div>
+            <div><span>${escapeHtml(t("live.historicalWeight"))}</span>${escapeHtml(formatPercent(profile.suggested_weight_pct))}</div>
+            <div><span>${escapeHtml(t("live.state"))}</span>${escapeHtml(signalLabel)}</div>
+            <div><span>${escapeHtml(t("live.mode"))}</span>${escapeHtml(item.submission_mode || "—")}</div>
+            <div><span>${escapeHtml(t("live.position"))}</span>${escapeHtml(item.position_qty || "0")}</div>
+            <div><span>${escapeHtml(t("live.pendingOrder"))}</span>${escapeHtml(item.pending_client_order_id || "—")}</div>
+            <div><span>${escapeHtml(t("live.lastCloseTime"))}</span>${escapeHtml(formatTime(item.last_close_time))}</div>
+            <div><span>${escapeHtml(t("live.chartRangeHigh"))}</span>${escapeHtml(formatNumber(item.chart_max))}</div>
+            <div><span>${escapeHtml(t("live.chartRangeMid"))}</span>${escapeHtml(formatNumber(item.chart_mid))}</div>
+            <div><span>${escapeHtml(t("live.chartRangeLow"))}</span>${escapeHtml(formatNumber(item.chart_min))}</div>
+          </div>
+          <div class="activity-log">
+            <h4>${escapeHtml(t("live.activity"))}</h4>
+            <ul class="activity-list">${activity.map((row) => `<li>${escapeHtml(row)}</li>`).join("")}</ul>
+          </div>
+        </article>
+      `;
     }
 
     function markerColor(kind) {
@@ -2601,6 +3752,15 @@ DASHBOARD_TEMPLATE = """<!doctype html>
           <div class="mini-metric"><span>Top Return</span><strong>${escapeHtml(formatPercent(summary.top_strategy_return_pct))}</strong></div>
           <div class="mini-metric"><span>Top Drawdown</span><strong>${escapeHtml(formatPercent(summary.top_strategy_drawdown_pct))}</strong></div>
         </div>
+        <div class="ops-row" style="margin-top:14px">
+          <button type="button" onclick="generateResearchStack()">${escapeHtml(t("research.generateStack"))}</button>
+        </div>
+        ${latest.generated_stack ? `
+          <div class="subtle" style="margin-top:10px">
+            ${escapeHtml(t("research.generatedStack"))}: ${escapeHtml(latest.generated_stack.name || "—")} ·
+            ${escapeHtml(formatNumber(latest.generated_stack.profile_count || 0))} profiles
+          </div>
+        ` : ""}
         ${renderPortfolioSimulation(latest.portfolio)}
         <ul class="research-list" style="margin-top:12px">${(summary.notes || []).map((note) => `<li>${escapeHtml(note)}</li>`).join("")}</ul>
       `;
@@ -2781,8 +3941,8 @@ DASHBOARD_TEMPLATE = """<!doctype html>
       const node = document.getElementById("actionResponse");
       if (!response?.ok) {
         node.innerHTML = `
-          <h3>Action Center</h3>
-          <div class="subtle">The last action failed.</div>
+          <h3>${escapeHtml(t("advanced.actionCenter"))}</h3>
+          <div class="subtle">${escapeHtml(currentLocale === "zh" ? "最近一次操作失败。" : "The last action failed.")}</div>
           <ul class="research-list" style="margin-top:12px">
             <li>${escapeHtml(response?.error || "Unknown error")}</li>
           </ul>
@@ -2791,7 +3951,7 @@ DASHBOARD_TEMPLATE = """<!doctype html>
       }
       const result = response.result || {};
       const action = payload.action;
-      let title = "Action Complete";
+      let title = currentLocale === "zh" ? "操作完成" : "Action Complete";
       let points = [];
       if (action === "start_stack" || action === "start_profile") {
         title = result.status === "ALREADY_RUNNING" ? "Already Running" : "Daemon Started";
@@ -2849,6 +4009,13 @@ DASHBOARD_TEMPLATE = """<!doctype html>
           `${result.candidate_count || 0} candidates analyzed`,
           `top allocation count ${(result.top_allocations || []).length}`,
         ];
+      } else if (action === "generate_research_stack") {
+        title = "Deployable Stack Generated";
+        points = [
+          `${result.stack?.name || "stack"} ready for deployment`,
+          `${result.stack?.profile_count || 0} profiles written`,
+          `path ${result.stack?.path || "—"}`,
+        ];
       } else {
         points = [result.status || "OK"];
       }
@@ -2862,7 +4029,7 @@ DASHBOARD_TEMPLATE = """<!doctype html>
 
     async function postAction(payload) {
       const responseNode = document.getElementById("actionResponse");
-      responseNode.innerHTML = `<h3>Action Center</h3><div class="subtle">Working…</div>`;
+      responseNode.innerHTML = `<h3>${escapeHtml(t("advanced.actionCenter"))}</h3><div class="subtle">${escapeHtml(currentLocale === "zh" ? "执行中…" : "Working…")}</div>`;
       try {
         const response = await fetch("/api/actions", {
           method: "POST",
@@ -2870,6 +4037,12 @@ DASHBOARD_TEMPLATE = """<!doctype html>
           body: JSON.stringify(payload),
         });
         const data = await response.json();
+        if (data?.ok && payload.action === "generate_research_stack" && data.result?.stack?.path) {
+          deploymentDraft.stackPath = data.result.stack.path;
+          deploymentDraft.profileBudgets = {};
+          currentPanel = "live";
+          window.localStorage.setItem("dashboardPanel", currentPanel);
+        }
         renderActionFeedback(payload, data);
         await refresh();
       } catch (error) {
@@ -2911,6 +4084,24 @@ DASHBOARD_TEMPLATE = """<!doctype html>
       postAction({ action: "refresh_portfolio" });
     }
 
+    function startLiveDeployment() {
+      const path = document.getElementById("liveStackPath").value;
+      const budget_overrides = {};
+      Object.entries(deploymentDraft.profileBudgets || {}).forEach(([name, value]) => {
+        const numeric = Number(value);
+        if (Number.isFinite(numeric) && numeric > 0) {
+          budget_overrides[name] = numeric;
+        }
+      });
+      postAction({ action: "start_stack", path, budget_overrides });
+    }
+
+    function stopLiveDeployment() {
+      const path = document.getElementById("liveStackPath").value;
+      const selected = (currentControls?.available_stacks || []).find((item) => item.path === path);
+      postAction({ action: "stop_stack", path, stack_name: selected?.name });
+    }
+
     function redeemEarnFlexible() {
       const asset = document.getElementById("redeemAsset").value.trim().toUpperCase();
       const amount = document.getElementById("redeemAmount").value.trim();
@@ -2937,6 +4128,10 @@ DASHBOARD_TEMPLATE = """<!doctype html>
         leverage: document.getElementById("researchLeverage").value.trim(),
         position_fraction: document.getElementById("researchPositionFraction").value.trim(),
       });
+    }
+
+    function generateResearchStack() {
+      postAction({ action: "generate_research_stack" });
     }
 
     function updateIntervalHint() {
@@ -2993,30 +4188,62 @@ DASHBOARD_TEMPLATE = """<!doctype html>
       postAction({ action: "sell_market_spot", symbol, submission_mode, quantity });
     }
 
+    function renderCurrentSnapshot(data, { force = false } = {}) {
+      currentSnapshot = data;
+      document.getElementById("generatedAt").textContent = `Refreshed ${data.generated_at} · every ${REFRESH_SECONDS}s`;
+      document.getElementById("environmentLabel").textContent = `Environment: ${data.environment}`;
+      if (force) {
+        Object.keys(sectionHashes).forEach((key) => delete sectionHashes[key]);
+      }
+      updateSection("summary", data.summary, renderSummary);
+      updateSection("stacks", data.stacks, renderStacks);
+      updateSection("services", data.services, renderServices);
+      updateSection("research", data.research || {}, renderResearch);
+      updateSection("portfolio", data.portfolio, renderPortfolio);
+      updateSection("orders", data.orders, renderOrders);
+      updateSection("events", data.events, renderEvents);
+      updateSection("runtime_files", data.runtime_files, renderRuntimeFiles);
+      updateSection("controls", data.controls, renderControls);
+      updateSection(
+        "live_workspace",
+        {
+          deployment: data.deployment || {},
+          strategy_charts: data.strategy_charts || [],
+          orders: data.orders || [],
+          events: data.events || [],
+        },
+        () => renderLiveWorkspace(data),
+      );
+      applyStaticTranslations();
+      switchPanel(currentPanel);
+    }
+
     async function refresh() {
       try {
         const response = await fetch("/api/snapshot", { cache: "no-store" });
         const data = await response.json();
-        document.getElementById("generatedAt").textContent = `Refreshed ${data.generated_at} · every ${REFRESH_SECONDS}s`;
-        document.getElementById("environmentLabel").textContent = `Environment: ${data.environment}`;
-        updateSection("summary", data.summary, renderSummary);
-        updateSection("stacks", data.stacks, renderStacks);
-        updateSection("services", data.services, renderServices);
-        updateSection("strategy_charts", data.strategy_charts || [], renderStrategyCharts);
-        updateSection("research", data.research || {}, renderResearch);
-        updateSection("portfolio", data.portfolio, renderPortfolio);
-        updateSection("orders", data.orders, renderOrders);
-        updateSection("events", data.events, renderEvents);
-        updateSection("runtime_files", data.runtime_files, renderRuntimeFiles);
-        updateSection("controls", data.controls, renderControls);
+        renderCurrentSnapshot(data);
       } catch (error) {
         document.getElementById("generatedAt").textContent = `Dashboard fetch failed: ${error}`;
       }
     }
 
+    document.getElementById("liveStackPath").addEventListener("change", (event) => {
+      deploymentDraft.stackPath = event.target.value;
+      deploymentDraft.profileBudgets = {};
+      if (currentSnapshot) renderLiveWorkspace(currentSnapshot);
+    });
+    document.getElementById("deploymentTotalBudget").addEventListener("change", (event) => {
+      deploymentDraft.totalBudget = Number(event.target.value || 0);
+      if (currentSnapshot?.deployment?.enabled) {
+        applySuggestedBudgets();
+      }
+    });
     document.getElementById("researchInterval").addEventListener("input", updateIntervalHint);
     document.getElementById("researchBars").addEventListener("input", updateIntervalHint);
     updateIntervalHint();
+    applyStaticTranslations();
+    switchPanel(currentPanel);
     refresh();
     window.setInterval(refresh, REFRESH_SECONDS * 1000);
   </script>

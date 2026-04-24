@@ -144,7 +144,10 @@ def test_render_dashboard_html_embeds_refresh_interval() -> None:
 
     assert "Local Ops Dashboard" in html
     assert "Live Strategy Charts" in html
+    assert "Live Deployment" in html
     assert "Strategy Lab" in html
+    assert "Live Console" in html
+    assert "Generate Deployable Stack" in html
     assert "Earn to Spot" in html
     assert "const REFRESH_SECONDS = 12;" in html
     assert "/api/snapshot" in html
@@ -194,6 +197,136 @@ profiles = ["demo_profile.toml"]
     result = control.handle_action({"action": "start_profile", "path": str((runtime_dir / "demo_profile.toml").resolve())})
     assert result["status"] == "STARTED"
     assert result["pid"] == 4242
+
+
+def test_start_stack_applies_budget_overrides_before_spawn(monkeypatch, tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    workspace_root = tmp_path / "workspace"
+    runtime_dir = workspace_root / "examples" / "runtime"
+    strategy_dir = workspace_root / "examples" / "strategies"
+    runtime_dir.mkdir(parents=True)
+    strategy_dir.mkdir(parents=True)
+    (strategy_dir / "dummy.py").write_text("def create_strategy(**kwargs):\n    return None\n", encoding="utf-8")
+    profile_path = runtime_dir / "demo_profile.toml"
+    profile_path.write_text(
+        """
+name = "demo-profile"
+market = "spot"
+strategy_ref = "examples/strategies/dummy.py:create_strategy"
+
+[params]
+symbol = "BTCUSDT"
+interval = "1h"
+quote_order_qty = "25"
+        """.strip(),
+        encoding="utf-8",
+    )
+    stack_path = runtime_dir / "demo_stack.toml"
+    stack_path.write_text(
+        """
+name = "demo-stack"
+profiles = ["demo_profile.toml"]
+        """.strip(),
+        encoding="utf-8",
+    )
+
+    class FakeProcess:
+        pid = 5252
+
+    monkeypatch.setattr("subprocess.Popen", lambda *args, **kwargs: FakeProcess())
+
+    control = DashboardControlPlane(settings=settings, workspace_root=workspace_root)
+    result = control.handle_action(
+        {
+            "action": "start_stack",
+            "path": str(stack_path.resolve()),
+            "budget_overrides": {"demo-profile": "120"},
+        }
+    )
+
+    updated = profile_path.read_text(encoding="utf-8")
+    assert result["status"] == "STARTED"
+    assert 'quote_order_qty = "120"' in updated
+    assert result["budget_updates"][0]["profile_name"] == "demo-profile"
+
+
+def test_generate_research_stack_writes_generated_runtime_bundle(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    workspace_root = tmp_path / "workspace"
+    (workspace_root / "examples" / "runtime").mkdir(parents=True)
+
+    control = DashboardControlPlane(settings=settings, workspace_root=workspace_root)
+    control.research_state_path.write_text(
+        json.dumps(
+            {
+                "request": {
+                    "market": "spot",
+                    "symbol": "BTCUSDT",
+                    "interval": "15m",
+                    "bars": 1500,
+                    "capital": 1000,
+                },
+                "summary": {
+                    "headline": "Keltner Breakout is strongest",
+                    "deployable_budget": 850,
+                },
+                "allocations": [
+                    {
+                        "name": "keltner_breakout",
+                        "title": "Keltner Breakout",
+                        "description": "Price breaks outside an ATR-based Keltner channel.",
+                        "score": 26.851,
+                        "allocation_pct": 29.93,
+                        "budget_amount": 254.38,
+                        "metrics": {
+                            "total_return_pct": 128.17,
+                            "max_drawdown_pct": 34.08,
+                        },
+                    },
+                    {
+                        "name": "ichimoku_trend",
+                        "title": "Ichimoku Trend",
+                        "description": "Cloud confirmation trend following.",
+                        "score": 21.4,
+                        "allocation_pct": 70.07,
+                        "budget_amount": 595.62,
+                        "metrics": {
+                            "total_return_pct": 65.2,
+                            "max_drawdown_pct": 12.4,
+                        },
+                    },
+                ],
+                "candidates": [],
+                "watchlist": [],
+                "avoid": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = control.handle_action({"action": "generate_research_stack", "stack_name": "lab core"})
+
+    stack_path = Path(result["stack"]["path"])
+    assert result["status"] == "OK"
+    assert result["stack"]["profile_count"] == 2
+    assert stack_path.exists()
+    assert "lab-core-" in stack_path.stem
+    stack_text = stack_path.read_text(encoding="utf-8")
+    assert 'profiles = ["' in stack_text
+
+    profile_paths = [Path(item["path"]) for item in result["stack"]["profiles"]]
+    assert all(path.exists() for path in profile_paths)
+    profile_text = profile_paths[0].read_text(encoding="utf-8")
+    assert 'strategy_ref = "examples/strategies/spot_builtin_persistent.py:create_strategy"' in profile_text
+    assert 'strategy_name = "keltner_breakout"' in profile_text
+    assert 'quote_order_qty = "254.38"' in profile_text
+
+    described = control.describe()
+    assert any(item["path"] == str(stack_path.resolve()) and item["generated"] for item in described["available_stacks"])
+    assert any(item["generated"] for item in described["available_profiles"])
+
+    updated_state = json.loads(control.research_state_path.read_text(encoding="utf-8"))
+    assert updated_state["generated_stack"]["path"] == str(stack_path.resolve())
 
 
 def test_candidate_row_exposes_window_and_full_sample_metrics(tmp_path: Path) -> None:

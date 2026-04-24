@@ -13,7 +13,7 @@ symbol = "BTCUSDT"
 interval = "1h"
 fast_period = 20
 slow_period = 50
-quote_order_qty = "100"
+quote_order_qty = "101.58"
 warmup_bars = 250
 
 [daemon]
