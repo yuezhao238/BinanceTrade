@@ -66,6 +66,12 @@ Primary references:
   - startup reconcile plus periodic reconcile for live credentials
   - SQLite-backed runtime status and heartbeat snapshots
   - daemon status and healthcheck commands for Docker or ops
+  - generated runtime stacks under `var/runtime/generated`
+- Local dashboard:
+  - split `Live Console` and `Research Lab` panels
+  - editable per-strategy budget planning before daemon start
+  - real-time live charts and action feeds once a daemon is running
+  - one-click generation of deployable Spot runtime stacks from Strategy Lab allocations
 - CLI for:
   - health checks
   - account inspection
@@ -232,8 +238,50 @@ The dashboard is now interactive, not read-only. It exposes a local control plan
 - doctor a stack or profile
 - reconcile Spot open orders for a symbol
 - send manual Spot market buys or sells in `DRY_RUN`, `TEST`, or `LIVE`
+- generate a deployable Spot runtime stack from the latest `Strategy Lab` allocation result
 
 The dashboard only exposes these white-listed actions. It does not run arbitrary shell commands.
+
+The dashboard is organized into two top-level workspaces:
+
+- `Live Console`
+  - choose a runtime stack
+  - review the historical default budget for each profile
+  - edit each profile budget before start
+  - launch or stop the daemon
+  - watch live curves, current metrics, and recent strategy actions
+- `Research Lab`
+  - benchmark the built-in strategy universe on one symbol / interval / assumption set
+  - inspect per-strategy charts, buy/sell markers, and equity curves
+  - inspect the simulated portfolio curve for the current allocation model
+  - generate a deployable Spot runtime stack from the latest research allocation
+
+### Strategy Lab -> Live Deployment
+
+The intended high-level workflow is:
+
+1. Open the dashboard.
+2. In `Research Lab`, run a strategy scan for your market, symbol, interval, budget, and fee assumptions.
+3. Review the allocation candidates, portfolio curve, and per-strategy charts.
+4. Click `Generate Deployable Stack`.
+5. Switch back to `Live Console`, review or edit the generated per-profile budgets, then click `Start Daemon`.
+
+Generated stacks are written under:
+
+- [var/runtime/generated](/Users/zhaoyue/Documents/Works/Playground/BinanceTrade/var/runtime/generated)
+
+Each generated profile uses the persistent built-in wrapper:
+
+- [spot_builtin_persistent.py](/Users/zhaoyue/Documents/Works/Playground/BinanceTrade/examples/strategies/spot_builtin_persistent.py:1)
+
+This wrapper keeps the selected built-in strategy running as a daemon-friendly Spot strategy instead of stopping after the first signal.
+
+Current scope:
+
+- generated deployment is supported for `spot` research results
+- generated profiles are `long` Spot profiles
+- the generated stack is automatically discovered by the dashboard and the daemon control plane
+- the generated stack preserves the Strategy Lab allocation ratios as the default deployment weights
 
 The operational model is documented in [runtime_operations.md](/Users/zhaoyue/Documents/Works/Playground/BinanceTrade/docs/runtime_operations.md:1).
 
@@ -485,6 +533,8 @@ BINANCE_ENV=mainnet binance-trade walkforward-preset global_spot_ema_btc_15m \
   --train-bars 1000 \
   --test-bars 250
 ```
+
+If you prefer the browser workflow, the same research result can now be pushed into deployment directly from `Strategy Lab` without manually writing TOML profiles. The dashboard generates a runtime stack under `var/runtime/generated`, then `Live Console` can launch it as a normal daemon stack.
 
 ## How To Fill `.env`
 
