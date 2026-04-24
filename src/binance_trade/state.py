@@ -649,6 +649,32 @@ class SQLiteStateStore:
             ).fetchall()
         return [self._runtime_stack_status_row_to_dict(row) for row in rows]
 
+    def list_orders(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM orders
+                ORDER BY updated_at DESC, created_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [self._order_row_to_dict(row) for row in rows]
+
+    def list_events(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM events
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [self._event_row_to_dict(row) for row in rows]
+
     def _runtime_status_row_to_dict(self, row: sqlite3.Row) -> dict[str, Any]:
         return {
             "service_name": str(row["service_name"]),
@@ -665,6 +691,37 @@ class SQLiteStateStore:
             "started_at": str(row["started_at"]),
             "last_heartbeat_at": str(row["last_heartbeat_at"]),
             "updated_at": str(row["updated_at"]),
+        }
+
+    def _order_row_to_dict(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "client_order_id": str(row["client_order_id"]),
+            "market_type": str(row["market_type"]),
+            "symbol": str(row["symbol"]),
+            "side": str(row["side"]),
+            "order_type": str(row["order_type"]),
+            "price": row["price"],
+            "quantity": row["quantity"],
+            "quote_order_qty": row["quote_order_qty"],
+            "status": str(row["status"]),
+            "exchange_order_id": row["exchange_order_id"],
+            "submission_mode": str(row["submission_mode"]),
+            "request": self._loads_json(row["request_json"]),
+            "response": self._loads_json(row["response_json"]),
+            "created_at": str(row["created_at"]),
+            "updated_at": str(row["updated_at"]),
+        }
+
+    def _event_row_to_dict(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": int(row["id"]),
+            "market_type": str(row["market_type"]),
+            "channel": str(row["channel"]),
+            "event_type": row["event_type"],
+            "symbol": row["symbol"],
+            "client_order_id": row["client_order_id"],
+            "payload": self._loads_json(row["payload_json"]),
+            "created_at": str(row["created_at"]),
         }
 
     def _runtime_stack_status_row_to_dict(self, row: sqlite3.Row) -> dict[str, Any]:

@@ -129,6 +129,33 @@ binance-trade daemon-stack-status global-spot-core
 binance-trade daemon-stack-health global-spot-core
 ```
 
+Run the local ops dashboard:
+
+```bash
+binance-trade run-dashboard
+```
+
+Open [http://127.0.0.1:8765](http://127.0.0.1:8765) and keep the daemon running in a separate terminal.
+
+If you only want the dashboard JSON payload for automation or quick inspection:
+
+```bash
+binance-trade dashboard-snapshot --no-portfolio
+```
+
+## Dashboard Operations
+
+The dashboard is a local control console, not only a monitor. The operations panel can:
+
+- start or stop a runtime stack
+- start or stop a single runtime profile
+- run `doctor` on a stack or profile
+- run Spot `reconcile` for a symbol
+- submit manual Spot market buys or sells
+
+For manual orders, keep the submission mode on `DRY_RUN` until you have explicitly validated the flow.  
+If you switch a dashboard order form to `LIVE`, it will submit a real order with your configured API key.
+
 ## Runtime State
 
 The daemon writes to two places:
@@ -153,5 +180,6 @@ The stack supervisor adds:
 4. Validate with `doctor-runtime-profile`.
 5. Choose whether to deploy one profile or a stack of profiles.
 6. Run under `run-daemon` or `run-daemon-stack` with `DRY_RUN=true`.
-7. Move to test orders.
-8. Move to live with small size.
+7. Observe health with `daemon-*` and the local dashboard.
+8. Move to test orders.
+9. Move to live with small size.

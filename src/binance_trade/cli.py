@@ -12,6 +12,7 @@ import typer
 from .builtin_strategies import create_strategy as create_builtin_strategy
 from .builtin_strategies import list_strategies as list_builtin_strategies
 from .config import get_settings
+from .dashboard import DashboardConfig, DashboardDataService, run_dashboard_server
 from .daemon import StrategyDaemon, StrategyDaemonStack, is_runtime_stack_status_healthy, is_runtime_status_healthy
 from .exceptions import BinanceTradeError
 from .logging_utils import setup_logging
@@ -221,6 +222,52 @@ def account() -> None:
     _run(_with_spot_service(lambda service: service.account()))
 
 
+@app.command("wallet-balance")
+def wallet_balance(
+    quote_asset: str = typer.Option("USDT", "--quote-asset", help="Quote asset used for wallet valuation."),
+) -> None:
+    _run(_with_spot_service(lambda service: service.wallet_balance(quote_asset=quote_asset)))
+
+
+@app.command("user-assets")
+def user_assets(
+    asset: str | None = typer.Option(None, "--asset", help="Optional asset filter such as USDT or BTC."),
+) -> None:
+    _run(_with_spot_service(lambda service: service.user_assets(asset=asset)))
+
+
+@app.command("portfolio")
+def portfolio(
+    quote_asset: str = typer.Option("USDT", "--quote-asset", help="Quote asset used for wallet valuation."),
+    asset: str | None = typer.Option(None, "--asset", help="Optional asset filter such as USDT or BTC."),
+) -> None:
+    _run(_with_spot_service(lambda service: service.portfolio_overview(quote_asset=quote_asset, asset=asset)))
+
+
+@app.command("redeem-earn-flex")
+def redeem_earn_flex(
+    asset: str | None = typer.Option(None, "--asset", help="Asset to redeem from Simple Earn flexible, such as USDT."),
+    product_id: str | None = typer.Option(None, "--product-id", help="Binance Simple Earn productId."),
+    amount: str | None = typer.Option(None, "--amount", help="Amount to redeem. Omit together with --redeem-all for full redemption."),
+    redeem_all: bool = typer.Option(False, "--redeem-all", help="Redeem the entire flexible position."),
+    dest_account: str = typer.Option("SPOT", "--dest-account", help="Destination account, usually SPOT."),
+    confirm: str = typer.Option("", "--confirm", help='Required for live redemption. Must be exactly "REDEEM".'),
+) -> None:
+    parsed_amount = None if amount in (None, "") else _decimal(amount)
+    _run(
+        _with_spot_service(
+            lambda service: service.redeem_simple_earn_flexible(
+                asset=asset,
+                product_id=product_id,
+                amount=parsed_amount,
+                redeem_all=redeem_all,
+                dest_account=dest_account,
+                confirmation_text=confirm,
+            )
+        )
+    )
+
+
 @app.command("buy-market")
 def buy_market(
     symbol: str = typer.Argument(..., help="Spot trading pair such as BTCUSDT."),
@@ -393,6 +440,25 @@ def show_runtime_stack(path: str = typer.Argument(..., help="Path to a runtime s
     _print_json({"runtime_stack": stack.to_dict()})
 
 
+@app.command("dashboard-snapshot")
+def dashboard_snapshot(
+    include_portfolio: bool = typer.Option(True, "--include-portfolio/--no-portfolio", help="Include a live portfolio snapshot."),
+    order_limit: int = typer.Option(25, "--order-limit", min=1, max=200, help="Recent order rows to include."),
+    event_limit: int = typer.Option(40, "--event-limit", min=1, max=500, help="Recent event rows to include."),
+) -> None:
+    settings = get_settings()
+    setup_logging(settings.log_level)
+    service = DashboardDataService(
+        settings=settings,
+        config=DashboardConfig(
+            include_portfolio=include_portfolio,
+            order_limit=order_limit,
+            event_limit=event_limit,
+        ),
+    )
+    _print_json(service.build_snapshot())
+
+
 @app.command("doctor-runtime-profile")
 def doctor_runtime_profile(
     path: str = typer.Argument(..., help="Path to a runtime profile TOML or JSON file."),
@@ -429,6 +495,32 @@ def run_daemon_stack(
 ) -> None:
     stack = _load_runtime_stack(path)
     _run(_run_daemon_stack(stack))
+
+
+@app.command("run-dashboard")
+def run_dashboard(
+    host: str = typer.Option("127.0.0.1", "--host", help="Bind host for the local dashboard server."),
+    port: int = typer.Option(8765, "--port", min=1, max=65535, help="Bind port for the local dashboard server."),
+    refresh_seconds: int = typer.Option(10, "--refresh-seconds", min=3, max=300, help="Client-side auto-refresh interval."),
+    portfolio_cache_seconds: int = typer.Option(15, "--portfolio-cache-seconds", min=5, max=600, help="Cache time for live portfolio polling."),
+    include_portfolio: bool = typer.Option(True, "--include-portfolio/--no-portfolio", help="Include a live account portfolio section."),
+    order_limit: int = typer.Option(25, "--order-limit", min=1, max=200, help="Recent order rows to display."),
+    event_limit: int = typer.Option(40, "--event-limit", min=1, max=500, help="Recent event rows to display."),
+) -> None:
+    settings = get_settings()
+    setup_logging(settings.log_level)
+    run_dashboard_server(
+        settings,
+        DashboardConfig(
+            host=host,
+            port=port,
+            refresh_seconds=refresh_seconds,
+            portfolio_cache_seconds=portfolio_cache_seconds,
+            include_portfolio=include_portfolio,
+            order_limit=order_limit,
+            event_limit=event_limit,
+        ),
+    )
 
 
 @app.command("daemon-status")

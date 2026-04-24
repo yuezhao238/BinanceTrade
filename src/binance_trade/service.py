@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 from dataclasses import replace
 from decimal import Decimal
+from itertools import chain
 from typing import Any
 
 from .config import Settings
@@ -31,6 +32,67 @@ def _build_authenticator(settings: Settings) -> Authenticator | None:
             recv_window_ms=Decimal(str(settings.recv_window_ms)),
         )
     return None
+
+
+def _decimal_or_zero(value: Any) -> Decimal:
+    if value in (None, "", False):
+        return Decimal("0")
+    try:
+        return Decimal(str(value))
+    except Exception:
+        return Decimal("0")
+
+
+def _filter_rows_with_positive_total(rows: list[dict[str, Any]], *, fields: tuple[str, ...]) -> list[dict[str, Any]]:
+    positive_rows: list[dict[str, Any]] = []
+    for row in rows:
+        total = sum((_decimal_or_zero(row.get(field)) for field in fields), start=Decimal("0"))
+        if total > 0:
+            positive_rows.append(row)
+    return positive_rows
+
+
+def _spot_account_summary(account: dict[str, Any]) -> dict[str, Any]:
+    balances = []
+    for balance in account.get("balances", []):
+        free = _decimal_or_zero(balance.get("free"))
+        locked = _decimal_or_zero(balance.get("locked"))
+        if free > 0 or locked > 0:
+            balances.append(balance)
+    return {
+        "canTrade": account.get("canTrade"),
+        "canWithdraw": account.get("canWithdraw"),
+        "canDeposit": account.get("canDeposit"),
+        "balances": balances,
+    }
+
+
+def _simple_earn_rows(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, dict):
+        rows = payload.get("rows")
+        if isinstance(rows, list):
+            return [item for item in rows if isinstance(item, dict)]
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    return []
+
+
+def _simple_earn_summary(payload: Any, *, amount_fields: tuple[str, ...]) -> dict[str, Any]:
+    rows = _simple_earn_rows(payload)
+    positive = _filter_rows_with_positive_total(rows, fields=amount_fields)
+    return {
+        "count": len(positive),
+        "positions": positive,
+        "raw": payload,
+    }
+
+
+def _simple_earn_position_total(position: dict[str, Any]) -> Decimal:
+    for field in ("totalAmount", "totalInvestedAmount", "holdingAmount", "amount", "lockedAmount"):
+        value = _decimal_or_zero(position.get(field))
+        if value > 0:
+            return value
+    return Decimal("0")
 
 
 class SpotTradingService:
@@ -128,6 +190,187 @@ class SpotTradingService:
         if not self.authenticator:
             raise ConfigError("API credentials are required for account queries")
         return await self.rest.get_account()
+
+    async def wallet_balance(self, *, quote_asset: str = "USDT") -> dict[str, Any]:
+        if not self.authenticator:
+            raise ConfigError("API credentials are required for wallet balance queries")
+        payload = await self.rest.get_wallet_balance(quote_asset=quote_asset)
+        return {
+            "environment": self.settings.binance_env.value,
+            "quote_asset": quote_asset.upper(),
+            "wallet_balance": payload,
+        }
+
+    async def user_assets(self, *, asset: str | None = None) -> dict[str, Any]:
+        if not self.authenticator:
+            raise ConfigError("API credentials are required for user asset queries")
+        payload = await self.rest.get_user_assets(asset=asset)
+        rows = [item for item in payload if isinstance(item, dict)] if isinstance(payload, list) else []
+        positive = _filter_rows_with_positive_total(
+            rows,
+            fields=("free", "locked", "freeze", "withdrawing", "ipoable", "btcValuation"),
+        )
+        return {
+            "environment": self.settings.binance_env.value,
+            "asset_filter": asset.upper() if asset else None,
+            "count": len(positive),
+            "assets": positive,
+            "raw": payload,
+        }
+
+    async def portfolio_overview(self, *, quote_asset: str = "USDT", asset: str | None = None) -> dict[str, Any]:
+        if not self.authenticator:
+            raise ConfigError("API credentials are required for portfolio queries")
+
+        payload: dict[str, Any] = {
+            "environment": self.settings.binance_env.value,
+            "quote_asset": quote_asset.upper(),
+            "asset_filter": asset.upper() if asset else None,
+        }
+
+        account = await self.rest.get_account()
+        payload["spot_account"] = _spot_account_summary(account)
+
+        sections: list[tuple[str, Any]] = [
+            ("wallet_balance", self.rest.get_wallet_balance(quote_asset=quote_asset)),
+            ("user_assets", self.rest.get_user_assets(asset=asset)),
+            ("funding_wallet", self.rest.get_funding_assets(asset=asset)),
+            ("simple_earn_account", self.rest.get_simple_earn_account()),
+            ("simple_earn_flexible", self.rest.get_simple_earn_flexible_positions(asset=asset)),
+            ("simple_earn_locked", self.rest.get_simple_earn_locked_positions(asset=asset)),
+        ]
+
+        for section_name, request in sections:
+            try:
+                result = await request
+            except BinanceTradeError as exc:
+                payload[f"{section_name}_error"] = str(exc)
+                continue
+
+            if section_name == "user_assets":
+                rows = [item for item in result if isinstance(item, dict)] if isinstance(result, list) else []
+                positive = _filter_rows_with_positive_total(
+                    rows,
+                    fields=("free", "locked", "freeze", "withdrawing", "ipoable", "btcValuation"),
+                )
+                payload[section_name] = {
+                    "count": len(positive),
+                    "assets": positive,
+                    "raw": result,
+                }
+            elif section_name == "funding_wallet":
+                rows = [item for item in result if isinstance(item, dict)] if isinstance(result, list) else []
+                positive = _filter_rows_with_positive_total(
+                    rows,
+                    fields=("free", "locked", "freeze", "withdrawing", "btcValuation"),
+                )
+                payload[section_name] = {
+                    "count": len(positive),
+                    "assets": positive,
+                    "raw": result,
+                }
+            elif section_name == "simple_earn_flexible":
+                payload[section_name] = _simple_earn_summary(
+                    result,
+                    amount_fields=("totalAmount", "totalInvestedAmount", "holdingAmount"),
+                )
+            elif section_name == "simple_earn_locked":
+                payload[section_name] = _simple_earn_summary(
+                    result,
+                    amount_fields=("amount", "holdingAmount", "lockedAmount"),
+                )
+            else:
+                payload[section_name] = result
+
+        balances = payload["spot_account"].get("balances", [])
+        funding_assets = payload.get("funding_wallet", {}).get("assets", [])
+        user_assets = payload.get("user_assets", {}).get("assets", [])
+        flexible_positions = payload.get("simple_earn_flexible", {}).get("positions", [])
+        locked_positions = payload.get("simple_earn_locked", {}).get("positions", [])
+        payload["summary"] = {
+            "spot_balance_count": len(balances),
+            "wallet_breakdown_count": len(payload.get("wallet_balance", [])) if isinstance(payload.get("wallet_balance"), list) else None,
+            "user_asset_count": len(user_assets),
+            "funding_asset_count": len(funding_assets),
+            "simple_earn_position_count": len(list(chain(flexible_positions, locked_positions))),
+        }
+        return payload
+
+    async def redeem_simple_earn_flexible(
+        self,
+        *,
+        asset: str | None = None,
+        product_id: str | None = None,
+        amount: Decimal | None = None,
+        redeem_all: bool = False,
+        dest_account: str = "SPOT",
+        require_confirmation: bool = True,
+        confirmation_text: str | None = None,
+    ) -> dict[str, Any]:
+        if not self.authenticator:
+            raise ConfigError("API credentials are required for Simple Earn redemption")
+        if require_confirmation and confirmation_text != "REDEEM":
+            raise ConfigError('Simple Earn redemption requires explicit confirmation_text="REDEEM"')
+        if not product_id and not asset:
+            raise ValueError("asset or product_id is required")
+        if amount is not None and amount <= 0:
+            raise ValueError("amount must be positive")
+        if amount is None:
+            redeem_all = True
+
+        resolved_position: dict[str, Any] | None = None
+        if product_id:
+            positions_payload = await self.rest.get_simple_earn_flexible_positions(size=100)
+        else:
+            positions_payload = await self.rest.get_simple_earn_flexible_positions(asset=asset, size=100)
+        positions = _simple_earn_rows(positions_payload)
+        positive_positions = [item for item in positions if _simple_earn_position_total(item) > 0]
+
+        if product_id:
+            resolved_position = next((item for item in positive_positions if str(item.get("productId", "")) == product_id), None)
+            if resolved_position is None:
+                raise ConfigError(f"Simple Earn flexible productId {product_id!r} was not found among positive positions")
+        else:
+            target_asset = str(asset or "").upper()
+            matching = [item for item in positive_positions if str(item.get("asset", "")).upper() in {target_asset, f"LD{target_asset}"}]
+            if not matching:
+                raise ConfigError(f"No positive Simple Earn flexible position was found for asset {target_asset}")
+            resolved_position = matching[0]
+            product_id = str(resolved_position.get("productId") or "").strip()
+            if not product_id:
+                raise ConfigError(f"Simple Earn position for {target_asset} did not include a productId")
+
+        position_total = _simple_earn_position_total(resolved_position)
+        if amount is not None and amount > position_total:
+            raise ConfigError(
+                f"Requested redeem amount {decimal_to_str(amount)} exceeds available flexible position {decimal_to_str(position_total)}"
+            )
+
+        response = await self.rest.redeem_simple_earn_flexible(
+            product_id=product_id,
+            amount=amount,
+            redeem_all=redeem_all,
+            dest_account=dest_account,
+        )
+        payload = {
+            "status": "OK",
+            "asset": None if resolved_position is None else resolved_position.get("asset"),
+            "product_id": product_id,
+            "amount": None if amount is None else decimal_to_str(amount),
+            "redeem_all": redeem_all,
+            "dest_account": dest_account.upper(),
+            "position_total": decimal_to_str(position_total),
+            "resolved_position": resolved_position,
+            "binance": response,
+        }
+        self.state.record_event(
+            market_type=MarketType.SPOT,
+            channel="wallet_ops",
+            event_type="simple_earn_flexible_redeem",
+            symbol=None if resolved_position is None else str(resolved_position.get("asset")),
+            payload=payload,
+        )
+        return payload
 
     async def get_klines(
         self,

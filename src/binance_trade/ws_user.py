@@ -11,6 +11,7 @@ import websockets
 
 from .exceptions import ConfigError
 from .signing import Authenticator
+from .utils import json_dumps
 
 LOGGER = logging.getLogger(__name__)
 
@@ -30,7 +31,7 @@ class UserDataStreamClient:
             "method": "userDataStream.subscribe.signature",
             "params": self.authenticator.build_ws_signed_params({}),
         }
-        await websocket.send(json.dumps(request))
+        await websocket.send(json_dumps(request))
         response = json.loads(await websocket.recv())
         status = response.get("status")
         if status != 200:

@@ -213,6 +213,28 @@ binance-trade daemon-stack-status global-spot-core
 binance-trade daemon-stack-health global-spot-core
 ```
 
+Run the local ops dashboard:
+
+```bash
+binance-trade run-dashboard
+```
+
+Or inspect the same dashboard payload without opening a browser:
+
+```bash
+binance-trade dashboard-snapshot --no-portfolio
+```
+
+The dashboard is now interactive, not read-only. It exposes a local control plane for:
+
+- start / stop a runtime stack
+- start / stop a runtime profile
+- doctor a stack or profile
+- reconcile Spot open orders for a symbol
+- send manual Spot market buys or sells in `DRY_RUN`, `TEST`, or `LIVE`
+
+The dashboard only exposes these white-listed actions. It does not run arbitrary shell commands.
+
 The operational model is documented in [runtime_operations.md](/Users/zhaoyue/Documents/Works/Playground/BinanceTrade/docs/runtime_operations.md:1).
 
 ### 7. Use built-in strategies
@@ -259,6 +281,24 @@ Inspect account:
 
 ```bash
 binance-trade account
+```
+
+Inspect wallet-level balance breakdown:
+
+```bash
+binance-trade wallet-balance --quote-asset USDT
+```
+
+Inspect positive user assets across available wallets:
+
+```bash
+binance-trade user-assets
+```
+
+Inspect an aggregated portfolio overview:
+
+```bash
+binance-trade portfolio --quote-asset USDT
 ```
 
 Dry-run market buy:
@@ -666,8 +706,10 @@ Or use Compose:
 docker compose up -d --build
 ```
 
+This now starts both the supervised trader and a local dashboard on [http://127.0.0.1:8765](http://127.0.0.1:8765).
+
 ## Next Extensions
 
 - more futures order types: `STOP_MARKET`, `TAKE_PROFIT_MARKET`, trailing stop, and GTD helpers
 - separate trade and user-data API keys
-- metrics, alerts, and process supervision
+- metrics and alert routing beyond the local dashboard

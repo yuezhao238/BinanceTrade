@@ -14,3 +14,24 @@ services:
       timeout: 10s
       retries: 3
       start_period: 45s
+  dashboard:
+    build: .
+    env_file:
+      - .env
+    volumes:
+      - ./var:/app/var
+      - ./examples:/app/examples:ro
+    ports:
+      - "8765:8765"
+    depends_on:
+      - trader
+    restart: unless-stopped
+    command:
+      [
+        "binance-trade",
+        "run-dashboard",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8765"
+      ]

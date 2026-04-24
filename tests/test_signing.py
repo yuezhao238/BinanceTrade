@@ -1,4 +1,5 @@
 import hmac
+import json
 from decimal import Decimal
 from hashlib import sha256
 
@@ -44,6 +45,7 @@ def test_authenticator_adds_timestamp_recv_window_and_signature() -> None:
     auth.time_offset_ms = 123
     params = auth.build_ws_signed_params({"symbol": "BTCUSDT"})
     assert params["apiKey"] == "key"
-    assert params["recvWindow"] == Decimal("5000")
+    assert params["recvWindow"] == 5000
     assert "timestamp" in params
     assert "signature" in params
+    json.dumps(params)

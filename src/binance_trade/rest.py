@@ -211,6 +211,53 @@ class BinanceSpotRestClient:
     async def get_account(self) -> dict[str, Any]:
         return await self._request_signed("GET", "/api/v3/account")
 
+    async def get_wallet_balance(self, *, quote_asset: str = "USDT") -> Any:
+        return await self._request_signed("GET", "/sapi/v1/asset/wallet/balance", params={"quoteAsset": quote_asset.upper()})
+
+    async def get_user_assets(self, *, asset: str | None = None) -> Any:
+        params: dict[str, Any] = {}
+        if asset:
+            params["asset"] = asset.upper()
+        return await self._request_signed("POST", "/sapi/v3/asset/getUserAsset", params=params)
+
+    async def get_funding_assets(self, *, asset: str | None = None) -> Any:
+        params: dict[str, Any] = {}
+        if asset:
+            params["asset"] = asset.upper()
+        return await self._request_signed("POST", "/sapi/v1/asset/get-funding-asset", params=params)
+
+    async def get_simple_earn_account(self) -> Any:
+        return await self._request_signed("GET", "/sapi/v1/simple-earn/account")
+
+    async def get_simple_earn_flexible_positions(self, *, asset: str | None = None, size: int = 100) -> Any:
+        params: dict[str, Any] = {"size": size}
+        if asset:
+            params["asset"] = asset.upper()
+        return await self._request_signed("GET", "/sapi/v1/simple-earn/flexible/position", params=params)
+
+    async def get_simple_earn_locked_positions(self, *, asset: str | None = None, size: int = 100) -> Any:
+        params: dict[str, Any] = {"size": size}
+        if asset:
+            params["asset"] = asset.upper()
+        return await self._request_signed("GET", "/sapi/v1/simple-earn/locked/position", params=params)
+
+    async def redeem_simple_earn_flexible(
+        self,
+        *,
+        product_id: str,
+        amount: Decimal | None = None,
+        redeem_all: bool = False,
+        dest_account: str = "SPOT",
+    ) -> Any:
+        params: dict[str, Any] = {
+            "productId": product_id,
+            "redeemAll": "true" if redeem_all else "false",
+            "destAccount": dest_account.upper(),
+        }
+        if amount is not None:
+            params["amount"] = str(amount)
+        return await self._request_signed("POST", "/sapi/v1/simple-earn/flexible/redeem", params=params)
+
     async def place_order(self, order: OrderRequest) -> dict[str, Any]:
         LOGGER.info("placing live order symbol=%s clientOrderId=%s", order.symbol, order.new_client_order_id)
         return await self._request_signed("POST", "/api/v3/order", params=order.to_rest_params())

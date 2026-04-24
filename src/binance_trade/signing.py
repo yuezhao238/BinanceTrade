@@ -16,7 +16,7 @@ from cryptography.hazmat.primitives.asymmetric import ed25519, padding, rsa
 from .config import Settings
 from .exceptions import ConfigError
 from .types import ApiKeyType
-from .utils import normalize_param_value
+from .utils import decimal_to_str, normalize_param_value
 
 
 class Signer(Protocol):
@@ -40,6 +40,14 @@ def build_rest_query(params: Mapping[str, Any]) -> str:
 def build_ws_payload(params: Mapping[str, Any]) -> str:
     pairs = sorted(_clean_params(params), key=lambda item: item[0])
     return "&".join(f"{key}={value}" for key, value in pairs)
+
+
+def _json_safe_ws_param_value(value: Any) -> Any:
+    if isinstance(value, Decimal):
+        if value == value.to_integral_value():
+            return int(value)
+        return decimal_to_str(value)
+    return value
 
 
 class HMACSigner:
@@ -125,4 +133,4 @@ class Authenticator:
         payload_params.setdefault("recvWindow", self.recv_window_ms)
         payload = build_ws_payload(payload_params)
         payload_params["signature"] = self.signer.sign(payload.encode("utf-8"))
-        return payload_params
+        return {key: _json_safe_ws_param_value(value) for key, value in payload_params.items()}
