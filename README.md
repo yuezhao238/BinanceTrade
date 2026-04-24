@@ -117,12 +117,14 @@ BINANCE_ENV=testnet
 DRY_RUN=true
 ```
 
-If your server or local IP gets Binance `451 restricted location` responses on `binance.com` or `testnet.binance.vision`, and you are trading through Binance.US, switch to:
+If your server or local IP gets Binance `451 restricted location` responses on `binance.com` or `testnet.binance.vision`, and you are actually trading through Binance.US, switch to:
 
 ```bash
 BINANCE_ENV=binance_us
 DRY_RUN=true
 ```
+
+For Binance Global users, the normal path in this starter is still `BINANCE_ENV=testnet` for dry runs and `BINANCE_ENV=mainnet` for production.
 
 `binance_us` is Spot-only in this project. USDⓈ-M Futures still require `BINANCE_ENV=mainnet` or `BINANCE_ENV=testnet` on Binance.com-compatible infrastructure.
 
@@ -181,34 +183,34 @@ The production path in this repo is:
 The included reference pair is:
 
 - strategy: [spot_ema_persistent.py](/Users/zhaoyue/Documents/Works/Playground/BinanceTrade/examples/strategies/spot_ema_persistent.py:1)
-- profile: [spot_ema_btcusdt.toml](/Users/zhaoyue/Documents/Works/Playground/BinanceTrade/examples/runtime/spot_ema_btcusdt.toml:1)
-- stack: [spot_us_core.toml](/Users/zhaoyue/Documents/Works/Playground/BinanceTrade/examples/runtime/spot_us_core.toml:1)
+- profile: [global_spot_ema_btcusdt.toml](/Users/zhaoyue/Documents/Works/Playground/BinanceTrade/examples/runtime/global_spot_ema_btcusdt.toml:1)
+- stack: [global_spot_core.toml](/Users/zhaoyue/Documents/Works/Playground/BinanceTrade/examples/runtime/global_spot_core.toml:1)
 
 Validate and run it:
 
 ```bash
-binance-trade show-runtime-profile examples/runtime/spot_ema_btcusdt.toml
-binance-trade doctor-runtime-profile examples/runtime/spot_ema_btcusdt.toml
-binance-trade run-daemon examples/runtime/spot_ema_btcusdt.toml
+binance-trade show-runtime-profile examples/runtime/global_spot_ema_btcusdt.toml
+binance-trade doctor-runtime-profile examples/runtime/global_spot_ema_btcusdt.toml
+binance-trade run-daemon examples/runtime/global_spot_ema_btcusdt.toml
 ```
 
 Or run multiple profiles as one supervised stack:
 
 ```bash
-binance-trade show-runtime-stack examples/runtime/spot_us_core.toml
-binance-trade doctor-runtime-stack examples/runtime/spot_us_core.toml
-binance-trade run-daemon-stack examples/runtime/spot_us_core.toml
+binance-trade show-runtime-stack examples/runtime/global_spot_core.toml
+binance-trade doctor-runtime-stack examples/runtime/global_spot_core.toml
+binance-trade run-daemon-stack examples/runtime/global_spot_core.toml
 ```
 
 Inspect daemon health:
 
 ```bash
 binance-trade daemon-status
-binance-trade daemon-status spot-ema-btcusdt
-binance-trade daemon-health spot-ema-btcusdt
+binance-trade daemon-status global-spot-ema-btcusdt
+binance-trade daemon-health global-spot-ema-btcusdt
 binance-trade daemon-stack-status
-binance-trade daemon-stack-status spot-us-core
-binance-trade daemon-stack-health spot-us-core
+binance-trade daemon-stack-status global-spot-core
+binance-trade daemon-stack-health global-spot-core
 ```
 
 The operational model is documented in [runtime_operations.md](/Users/zhaoyue/Documents/Works/Playground/BinanceTrade/docs/runtime_operations.md:1).
@@ -380,7 +382,7 @@ The project now includes a research-grade backtest layer with explicit assumptio
 Backtest a preset:
 
 ```bash
-binance-trade backtest-preset binance_us_spot_ema_btc_15m
+binance-trade backtest-preset global_spot_ema_btc_15m
 ```
 
 Backtest any built-in strategy directly:
@@ -399,7 +401,7 @@ See the full workflow in [research_workflow.md](/Users/zhaoyue/Documents/Works/P
 Benchmark every built-in strategy on one common market, symbol, and interval, then generate JSON, SVG charts, and an HTML report:
 
 ```bash
-BINANCE_ENV=binance_us binance-trade benchmark-builtin-strategies \
+BINANCE_ENV=mainnet binance-trade benchmark-builtin-strategies \
   --market spot \
   --symbol BTCUSDT \
   --interval 15m \
@@ -417,7 +419,7 @@ The command writes:
 You can speed up broad universe scans with multiple workers:
 
 ```bash
-BINANCE_ENV=binance_us binance-trade benchmark-builtin-strategies \
+BINANCE_ENV=mainnet binance-trade benchmark-builtin-strategies \
   --market spot \
   --symbol BTCUSDT \
   --interval 15m \
@@ -428,7 +430,7 @@ BINANCE_ENV=binance_us binance-trade benchmark-builtin-strategies \
 Run walk-forward analysis on a built-in strategy:
 
 ```bash
-BINANCE_ENV=binance_us binance-trade walkforward-builtin-strategy ema_crossover \
+BINANCE_ENV=mainnet binance-trade walkforward-builtin-strategy ema_crossover \
   --market spot \
   --bars 2000 \
   --train-bars 1000 \
@@ -439,7 +441,7 @@ BINANCE_ENV=binance_us binance-trade walkforward-builtin-strategy ema_crossover 
 Or on a preset:
 
 ```bash
-BINANCE_ENV=binance_us binance-trade walkforward-preset binance_us_spot_ema_btc_15m \
+BINANCE_ENV=mainnet binance-trade walkforward-preset global_spot_ema_btc_15m \
   --train-bars 1000 \
   --test-bars 250
 ```
@@ -480,6 +482,7 @@ FUTURES_ORDER_COOLDOWN_SECONDS=5
 FUTURES_ALLOWED_SYMBOLS=BTCUSDT,ETHUSDT
 
 REQUEST_TIMEOUT_SECONDS=10
+NETWORK_TRUST_ENV=false
 RECV_WINDOW_MS=5000
 DAEMON_HEARTBEAT_INTERVAL_SECONDS=30
 DAEMON_RECONCILE_INTERVAL_SECONDS=300
@@ -488,7 +491,19 @@ DAEMON_MAX_RESTART_DELAY_SECONDS=60
 DAEMON_STALE_AFTER_SECONDS=90
 ```
 
+### Mainnet HMAC example
+
+```bash
+BINANCE_ENV=mainnet
+BINANCE_API_KEY=your_live_key
+BINANCE_API_SECRET=your_live_secret
+BINANCE_API_KEY_TYPE=HMAC
+DRY_RUN=true
+```
+
 ### Binance.US Spot example
+
+Only use this branch if your account is actually on Binance.US:
 
 ```bash
 BINANCE_ENV=binance_us
@@ -502,17 +517,8 @@ ALLOWED_SYMBOLS=BTCUSDT,ETHUSDT,BTCUSD,ETHUSD
 STATE_DB_PATH=var/state.db
 RUNTIME_DIR=var/runtime
 REQUEST_TIMEOUT_SECONDS=10
+NETWORK_TRUST_ENV=false
 RECV_WINDOW_MS=5000
-```
-
-### Mainnet HMAC example
-
-```bash
-BINANCE_ENV=mainnet
-BINANCE_API_KEY=your_live_key
-BINANCE_API_SECRET=your_live_secret
-BINANCE_API_KEY_TYPE=HMAC
-DRY_RUN=true
 ```
 
 ### Mainnet RSA or Ed25519 example
@@ -542,6 +548,7 @@ DRY_RUN=true
 - `STATE_DB_PATH`: SQLite file for orders and events
 - `RUNTIME_DIR`: JSON heartbeat directory for daemon status files
 - `DAEMON_*`: default heartbeat, reconcile, restart, and stale thresholds for daemon profiles
+- `NETWORK_TRUST_ENV`: when `true`, REST and WebSocket clients inherit proxy settings from the shell environment; keep this `false` unless you intentionally need that
 - `RECV_WINDOW_MS`: Binance signed request receive window
 
 ### `451 restricted location` means
@@ -553,6 +560,28 @@ Service unavailable from a restricted location according to 'b. Eligibility'
 ```
 
 that is an exchange-side geo-eligibility block, not a bug in your strategy code.
+
+### `ProxyError: 503 Service Unavailable` means
+
+If you see a transport error mentioning `ProxyError` or `503 Service Unavailable` before Binance returns any JSON, the process is usually trying to reach Binance through an HTTP proxy.
+
+For this repo, the safest default is:
+
+```bash
+NETWORK_TRUST_ENV=false
+```
+
+If you intentionally need a proxy, set:
+
+```bash
+NETWORK_TRUST_ENV=true
+```
+
+Otherwise clear `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY`, then rerun:
+
+```bash
+binance-trade doctor-runtime-stack examples/runtime/global_spot_core.toml
+```
 
 - For Binance.US accounts: set `BINANCE_ENV=binance_us`.
 - For Binance.com Spot/Testnet: run the bot from a Binance.com-supported jurisdiction/IP.
@@ -614,21 +643,21 @@ Build:
 docker build -t binance-trade .
 ```
 
-Validate the stack locally:
+Validate the global stack locally:
 
 ```bash
 docker run --rm --env-file .env -v "$(pwd)/var:/app/var" -v "$(pwd)/examples:/app/examples:ro" \
-  binance-trade binance-trade doctor-runtime-stack examples/runtime/spot_us_core.toml
+  binance-trade binance-trade doctor-runtime-stack examples/runtime/global_spot_core.toml
 ```
 
-Run the supervised stack daemon:
+Run the supervised global stack daemon:
 
 ```bash
 docker run -d --name binance-trader --restart unless-stopped \
   --env-file .env \
   -v "$(pwd)/var:/app/var" \
   -v "$(pwd)/examples:/app/examples:ro" \
-  binance-trade binance-trade run-daemon-stack examples/runtime/spot_us_core.toml
+  binance-trade binance-trade run-daemon-stack examples/runtime/global_spot_core.toml
 ```
 
 Or use Compose:

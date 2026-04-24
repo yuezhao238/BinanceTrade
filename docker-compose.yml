@@ -7,9 +7,9 @@ services:
       - ./var:/app/var
       - ./examples:/app/examples:ro
     restart: unless-stopped
-    command: ["binance-trade", "run-daemon-stack", "examples/runtime/spot_us_core.toml"]
+    command: ["binance-trade", "run-daemon-stack", "examples/runtime/global_spot_core.toml"]
     healthcheck:
-      test: ["CMD", "binance-trade", "daemon-stack-health", "spot-us-core"]
+      test: ["CMD", "binance-trade", "daemon-stack-health", "global-spot-core"]
       interval: 30s
       timeout: 10s
       retries: 3

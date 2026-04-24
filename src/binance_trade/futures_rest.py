@@ -8,7 +8,7 @@ from typing import Any
 import httpx
 
 from .config import Settings
-from .exceptions import BinanceAPIError, BinanceExecutionUnknown, ConfigError, with_restricted_location_hint
+from .exceptions import BinanceAPIError, BinanceExecutionUnknown, ConfigError, NetworkError, format_transport_error, with_restricted_location_hint
 from .filters import SymbolRules, parse_symbol_rules
 from .signing import Authenticator
 from .types import MarketType, OrderRequest
@@ -27,6 +27,7 @@ class BinanceFuturesRestClient:
             base_url=self.settings.resolved_futures_rest_base_url,
             timeout=self.settings.request_timeout_seconds,
             headers=headers,
+            trust_env=self.settings.network_trust_env,
         )
         self._rules_cache: dict[str, SymbolRules] = {}
 
@@ -39,15 +40,26 @@ class BinanceFuturesRestClient:
     async def close(self) -> None:
         await self._client.aclose()
 
+    def _raise_transport_error(self, exc: httpx.TransportError, *, method: str, path: str, attempts: int) -> None:
+        target = f"{method.upper()} {self.settings.resolved_futures_rest_base_url}{path}"
+        raise NetworkError(
+            format_transport_error(
+                exc,
+                target=target,
+                trust_env=self.settings.network_trust_env,
+                attempts=attempts,
+            )
+        ) from exc
+
     async def _request_public(self, method: str, path: str, *, params: dict[str, Any] | None = None) -> Any:
         attempts = 3
         for attempt in range(1, attempts + 1):
             try:
                 response = await self._client.request(method.upper(), path, params=params)
                 return self._handle_response(response)
-            except httpx.TransportError:
+            except httpx.TransportError as exc:
                 if attempt >= attempts:
-                    raise
+                    self._raise_transport_error(exc, method=method, path=path, attempts=attempt)
                 await asyncio.sleep(0.5 * attempt)
         raise RuntimeError("unreachable")
 
@@ -57,21 +69,27 @@ class BinanceFuturesRestClient:
 
         payload = self.authenticator.build_rest_signed_payload(params or {})
         method = method.upper()
-        if method in {"GET", "DELETE"}:
-            response = await self._client.request(method, f"{path}?{payload}")
-        else:
-            response = await self._client.request(
-                method,
-                path,
-                content=payload,
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-            )
+        try:
+            if method in {"GET", "DELETE"}:
+                response = await self._client.request(method, f"{path}?{payload}")
+            else:
+                response = await self._client.request(
+                    method,
+                    path,
+                    content=payload,
+                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                )
+        except httpx.TransportError as exc:
+            self._raise_transport_error(exc, method=method, path=path, attempts=1)
         return self._handle_response(response)
 
     async def _request_api_key(self, method: str, path: str, *, params: dict[str, Any] | None = None) -> Any:
         if not self.authenticator:
             raise ConfigError("API credentials are required for API-key requests")
-        response = await self._client.request(method.upper(), path, params=params)
+        try:
+            response = await self._client.request(method.upper(), path, params=params)
+        except httpx.TransportError as exc:
+            self._raise_transport_error(exc, method=method, path=path, attempts=1)
         return self._handle_response(response)
 
     def _handle_response(self, response: httpx.Response) -> Any:

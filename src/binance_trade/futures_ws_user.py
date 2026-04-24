@@ -14,9 +14,10 @@ LOGGER = logging.getLogger(__name__)
 
 
 class FuturesUserDataStreamClient:
-    def __init__(self, ws_base_url: str, rest_client: BinanceFuturesRestClient) -> None:
+    def __init__(self, ws_base_url: str, rest_client: BinanceFuturesRestClient, *, trust_env: bool = False) -> None:
         self.ws_base_url = ws_base_url.rstrip("/")
         self.rest_client = rest_client
+        self.proxy = True if trust_env else None
 
     async def _keepalive_loop(self, listen_key: str) -> None:
         while True:
@@ -35,7 +36,7 @@ class FuturesUserDataStreamClient:
             try:
                 url = f"{self.ws_base_url}/ws/{listen_key}"
                 LOGGER.info("connecting futures user stream url=%s", url)
-                async with websockets.connect(url, ping_interval=None, max_size=None) as websocket:
+                async with websockets.connect(url, ping_interval=None, max_size=None, proxy=self.proxy) as websocket:
                     keepalive_task = asyncio.create_task(self._keepalive_loop(listen_key))
                     backoff_seconds = 1
                     async for raw_message in websocket:

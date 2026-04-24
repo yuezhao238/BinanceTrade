@@ -1,0 +1,16 @@
+name = "global-spot-core"
+description = "A small multi-strategy runtime stack for Binance Global spot, combining BTC and ETH persistent EMA daemons."
+notes = [
+  "This is the default stack-level entrypoint for Binance Global spot accounts.",
+  "Each member profile keeps its own state, heartbeat, and restart policy.",
+]
+profiles = [
+  "global_spot_ema_btcusdt.toml",
+  "global_spot_ema_ethusdt.toml",
+]
+
+[settings]
+heartbeat_interval_seconds = 30
+stale_after_seconds = 90
+stop_on_member_exit = true
+stop_on_member_failure = true

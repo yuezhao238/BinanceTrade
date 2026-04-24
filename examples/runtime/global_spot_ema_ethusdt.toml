@@ -1,8 +1,8 @@
-name = "spot-ema-ethusdt"
+name = "global-spot-ema-ethusdt"
 market = "spot"
 strategy_ref = "examples/strategies/spot_ema_persistent.py:create_strategy"
 submission_mode = "inherit"
-description = "Persistent ETHUSDT spot EMA daemon profile with user-stream reconciliation and restart supervision."
+description = "Persistent ETHUSDT spot EMA daemon profile for Binance Global spot, with user-stream reconciliation and restart supervision."
 notes = [
   "Keep this in DRY_RUN until its fills and position reconciliation are verified independently.",
 ]

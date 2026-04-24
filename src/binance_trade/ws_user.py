@@ -16,9 +16,10 @@ LOGGER = logging.getLogger(__name__)
 
 
 class UserDataStreamClient:
-    def __init__(self, ws_api_url: str, authenticator: Authenticator | None) -> None:
+    def __init__(self, ws_api_url: str, authenticator: Authenticator | None, *, trust_env: bool = False) -> None:
         self.ws_api_url = ws_api_url
         self.authenticator = authenticator
+        self.proxy = True if trust_env else None
 
     async def _subscribe(self, websocket: Any) -> dict[str, Any]:
         if not self.authenticator:
@@ -45,7 +46,7 @@ class UserDataStreamClient:
         while True:
             try:
                 LOGGER.info("connecting user stream url=%s", self.ws_api_url)
-                async with websockets.connect(self.ws_api_url, ping_interval=None, max_size=None) as websocket:
+                async with websockets.connect(self.ws_api_url, ping_interval=None, max_size=None, proxy=self.proxy) as websocket:
                     subscribe_response = await self._subscribe(websocket)
                     yield subscribe_response
                     backoff_seconds = 1

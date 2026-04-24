@@ -51,8 +51,12 @@ class SpotTradingService:
             self.state,
         )
         self.rest = BinanceSpotRestClient(settings, self.authenticator)
-        self.market = MarketStreamClient(settings.resolved_market_ws_url)
-        self.user_stream = UserDataStreamClient(settings.resolved_ws_api_url, self.authenticator)
+        self.market = MarketStreamClient(settings.resolved_market_ws_url, trust_env=settings.network_trust_env)
+        self.user_stream = UserDataStreamClient(
+            settings.resolved_ws_api_url,
+            self.authenticator,
+            trust_env=settings.network_trust_env,
+        )
 
     async def __aenter__(self) -> "SpotTradingService":
         return self
@@ -344,8 +348,12 @@ class FuturesTradingService:
             self.state,
         )
         self.rest = BinanceFuturesRestClient(settings, self.authenticator)
-        self.market = MarketStreamClient(settings.resolved_futures_market_ws_url)
-        self.user_stream = FuturesUserDataStreamClient(settings.resolved_futures_user_ws_base_url, self.rest)
+        self.market = MarketStreamClient(settings.resolved_futures_market_ws_url, trust_env=settings.network_trust_env)
+        self.user_stream = FuturesUserDataStreamClient(
+            settings.resolved_futures_user_ws_base_url,
+            self.rest,
+            trust_env=settings.network_trust_env,
+        )
 
     async def __aenter__(self) -> "FuturesTradingService":
         return self

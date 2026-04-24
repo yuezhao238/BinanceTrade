@@ -50,6 +50,7 @@ class Settings(BaseSettings):
     futures_allowed_symbols: list[str] = Field(default_factory=list, alias="FUTURES_ALLOWED_SYMBOLS")
 
     request_timeout_seconds: float = Field(default=10.0, alias="REQUEST_TIMEOUT_SECONDS")
+    network_trust_env: bool = Field(default=False, alias="NETWORK_TRUST_ENV")
     recv_window_ms: float = Field(default=5000.0, alias="RECV_WINDOW_MS")
     daemon_heartbeat_interval_seconds: int = Field(default=30, alias="DAEMON_HEARTBEAT_INTERVAL_SECONDS")
     daemon_reconcile_interval_seconds: int = Field(default=300, alias="DAEMON_RECONCILE_INTERVAL_SECONDS")

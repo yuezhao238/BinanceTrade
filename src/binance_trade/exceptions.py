@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+import httpx
+
 
 class BinanceTradeError(Exception):
     """Base application exception."""
@@ -10,6 +12,10 @@ class BinanceTradeError(Exception):
 
 class ConfigError(BinanceTradeError):
     """Configuration is incomplete or invalid."""
+
+
+class NetworkError(BinanceTradeError):
+    """Network transport to Binance failed."""
 
 
 def with_restricted_location_hint(message: str, *, environment: str, market_type: str) -> str:
@@ -36,6 +42,42 @@ def with_restricted_location_hint(message: str, *, environment: str, market_type
         )
 
     return f"{message} Hint: {hint}"
+
+
+def format_transport_error(exc: Exception, *, target: str, trust_env: bool, attempts: int = 1) -> str:
+    attempt_note = f" after {attempts} attempts" if attempts > 1 else ""
+    detail = str(exc).strip() or exc.__class__.__name__
+
+    if isinstance(exc, httpx.ProxyError):
+        hint = (
+            "The process attempted to use an HTTP(S) proxy and the proxy rejected the request. "
+            "If Binance should be reached directly, set NETWORK_TRUST_ENV=false or clear "
+            "HTTP_PROXY, HTTPS_PROXY, ALL_PROXY, and NO_PROXY."
+        )
+        if not trust_env:
+            hint = (
+                "A proxy failure happened even though NETWORK_TRUST_ENV=false. Verify local network interception, "
+                "VPN/proxy software, or an upstream gateway."
+            )
+        return f"proxy_error{attempt_note} target={target} detail={detail}. {hint}"
+
+    if isinstance(exc, httpx.TimeoutException):
+        return (
+            f"timeout{attempt_note} target={target} detail={detail}. "
+            "Verify connectivity to the selected Binance endpoint and increase REQUEST_TIMEOUT_SECONDS only if the "
+            "network path is actually healthy."
+        )
+
+    if isinstance(exc, httpx.ConnectError):
+        return (
+            f"connect_error{attempt_note} target={target} detail={detail}. "
+            "Check DNS resolution, outbound connectivity, proxy settings, and exchange reachability."
+        )
+
+    return (
+        f"network_error{attempt_note} target={target} detail={detail}. "
+        "Check connectivity, proxy settings, and Binance endpoint availability."
+    )
 
 
 @dataclass(slots=True)

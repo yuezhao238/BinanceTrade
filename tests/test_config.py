@@ -18,3 +18,8 @@ def test_binance_us_rejects_futures_endpoints() -> None:
     with pytest.raises(ConfigError):
         settings.assert_futures_supported()
 
+
+def test_network_trust_env_defaults_to_false() -> None:
+    settings = Settings(BINANCE_ENV="mainnet")
+
+    assert settings.network_trust_env is False

@@ -50,7 +50,7 @@ This is not a substitute for production reconciliation, but it is a much better 
 ```bash
 binance-trade list-presets
 
-binance-trade backtest-preset binance_us_spot_ema_btc_15m
+binance-trade backtest-preset global_spot_ema_btc_15m
 
 binance-trade backtest-builtin-strategy ema_crossover \
   --market spot \

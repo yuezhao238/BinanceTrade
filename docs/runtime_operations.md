@@ -51,10 +51,10 @@ Stacks are TOML or JSON files that reference multiple runtime profiles.
 Example:
 
 ```toml
-name = "spot-us-core"
+name = "global-spot-core"
 profiles = [
-  "spot_ema_btcusdt.toml",
-  "spot_ema_ethusdt.toml",
+  "global_spot_ema_btcusdt.toml",
+  "global_spot_ema_ethusdt.toml",
 ]
 
 [settings]
@@ -69,58 +69,64 @@ stop_on_member_failure = true
 Inspect the profile:
 
 ```bash
-binance-trade show-runtime-profile examples/runtime/spot_ema_btcusdt.toml
+binance-trade show-runtime-profile examples/runtime/global_spot_ema_btcusdt.toml
 ```
 
 Check exchange connectivity, filters, and resolved mode:
 
 ```bash
-binance-trade doctor-runtime-profile examples/runtime/spot_ema_btcusdt.toml
+binance-trade doctor-runtime-profile examples/runtime/global_spot_ema_btcusdt.toml
 ```
 
 Run the daemon:
 
 ```bash
-binance-trade run-daemon examples/runtime/spot_ema_btcusdt.toml
+binance-trade run-daemon examples/runtime/global_spot_ema_btcusdt.toml
 ```
 
 Inspect current runtime state:
 
 ```bash
 binance-trade daemon-status
-binance-trade daemon-status spot-ema-btcusdt
+binance-trade daemon-status global-spot-ema-btcusdt
 ```
 
 Use in container healthchecks:
 
 ```bash
-binance-trade daemon-health spot-ema-btcusdt
+binance-trade daemon-health global-spot-ema-btcusdt
 ```
 
 Inspect the stack:
 
 ```bash
-binance-trade show-runtime-stack examples/runtime/spot_us_core.toml
+binance-trade show-runtime-stack examples/runtime/global_spot_core.toml
 ```
 
 Check every member profile in the stack:
 
 ```bash
-binance-trade doctor-runtime-stack examples/runtime/spot_us_core.toml
+binance-trade doctor-runtime-stack examples/runtime/global_spot_core.toml
+```
+
+If this reports a `ProxyError` before any Binance JSON response, disable environment-inherited proxies for the bot:
+
+```bash
+NETWORK_TRUST_ENV=false
 ```
 
 Run the stack:
 
 ```bash
-binance-trade run-daemon-stack examples/runtime/spot_us_core.toml
+binance-trade run-daemon-stack examples/runtime/global_spot_core.toml
 ```
 
 Inspect stack-level health:
 
 ```bash
 binance-trade daemon-stack-status
-binance-trade daemon-stack-status spot-us-core
-binance-trade daemon-stack-health spot-us-core
+binance-trade daemon-stack-status global-spot-core
+binance-trade daemon-stack-health global-spot-core
 ```
 
 ## Runtime State

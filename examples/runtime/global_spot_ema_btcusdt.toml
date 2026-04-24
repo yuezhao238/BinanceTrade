@@ -1,10 +1,10 @@
-name = "spot-ema-btcusdt"
+name = "global-spot-ema-btcusdt"
 market = "spot"
 strategy_ref = "examples/strategies/spot_ema_persistent.py:create_strategy"
 submission_mode = "inherit"
-description = "Persistent BTCUSDT spot EMA daemon profile with user-stream reconciliation and restart supervision."
+description = "Persistent BTCUSDT spot EMA daemon profile for Binance Global spot, with user-stream reconciliation and restart supervision."
 notes = [
-  "Use this as the production template, not the one-shot built-in strategies.",
+  "This is the default production template for Binance Global spot accounts.",
   "Keep DRY_RUN=true until doctor-runtime-profile, watch-user, and daemon-health are stable.",
 ]
 

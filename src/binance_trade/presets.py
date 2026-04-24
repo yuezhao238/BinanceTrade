@@ -24,13 +24,13 @@ class StrategyPreset:
 
 
 PRESETS: dict[str, StrategyPreset] = {
-    "binance_us_spot_ema_btc_15m": StrategyPreset(
-        name="binance_us_spot_ema_btc_15m",
-        title="Binance.US Spot EMA BTC 15m",
+    "global_spot_ema_btc_15m": StrategyPreset(
+        name="global_spot_ema_btc_15m",
+        title="Global Spot EMA BTC 15m",
         strategy_name="ema_crossover",
         market=MarketType.SPOT,
         description="Long-only BTC spot trend follow using the classic 12/26 EMA crossover on 15m bars.",
-        environments=("binance_us", "mainnet"),
+        environments=("mainnet", "testnet"),
         params={
             "symbol": "BTCUSDT",
             "interval": "15m",
@@ -47,13 +47,13 @@ PRESETS: dict[str, StrategyPreset] = {
             "Use lower slippage assumptions only if your actual fills justify it.",
         ),
     ),
-    "binance_us_spot_bollinger_eth_5m": StrategyPreset(
-        name="binance_us_spot_bollinger_eth_5m",
-        title="Binance.US Spot Bollinger ETH 5m",
+    "global_spot_bollinger_eth_5m": StrategyPreset(
+        name="global_spot_bollinger_eth_5m",
+        title="Global Spot Bollinger ETH 5m",
         strategy_name="bollinger_mean_reversion",
         market=MarketType.SPOT,
         description="Long-only ETH spot mean reversion after lower-band recovery on 5m bars.",
-        environments=("binance_us", "mainnet"),
+        environments=("mainnet", "testnet"),
         params={
             "symbol": "ETHUSDT",
             "interval": "5m",
@@ -165,6 +165,11 @@ def list_presets() -> list[dict[str, Any]]:
 
 def get_preset(name: str) -> StrategyPreset:
     normalized = name.strip().lower()
+    aliases = {
+        "binance_us_spot_ema_btc_15m": "global_spot_ema_btc_15m",
+        "binance_us_spot_bollinger_eth_5m": "global_spot_bollinger_eth_5m",
+    }
+    normalized = aliases.get(normalized, normalized)
     if normalized not in PRESETS:
         available = ", ".join(sorted(PRESETS))
         raise ValueError(f"unknown preset {name!r}; available: {available}")
