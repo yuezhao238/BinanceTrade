@@ -12,13 +12,13 @@ import typer
 from .builtin_strategies import create_strategy as create_builtin_strategy
 from .builtin_strategies import list_strategies as list_builtin_strategies
 from .config import get_settings
-from .daemon import StrategyDaemon, is_runtime_status_healthy
+from .daemon import StrategyDaemon, StrategyDaemonStack, is_runtime_stack_status_healthy, is_runtime_status_healthy
 from .exceptions import BinanceTradeError
 from .logging_utils import setup_logging
 from .presets import get_preset, list_presets as list_research_presets
 from .research import BacktestConfig, benchmark_builtin_strategies, fetch_recent_candles, run_backtest, run_walkforward_analysis
 from .research_report import write_benchmark_report, write_walkforward_report
-from .runtime_profiles import RuntimeProfile, load_runtime_profile
+from .runtime_profiles import RuntimeProfile, RuntimeStack, load_runtime_profile, load_runtime_stack
 from .service import FuturesTradingService, SpotTradingService
 from .state import SQLiteStateStore
 from .strategy_runtime import StrategyRunner, load_strategy, parse_strategy_params
@@ -95,6 +95,16 @@ def _load_runtime_profile(path: str) -> RuntimeProfile:
     return load_runtime_profile(Path(path))
 
 
+def _load_runtime_stack(path: str) -> RuntimeStack:
+    return load_runtime_stack(Path(path))
+
+
+def _service_factory_for_profile(settings: Any, profile: RuntimeProfile) -> Any:
+    if profile.market is MarketType.SPOT:
+        return lambda: SpotTradingService(settings)
+    return lambda: FuturesTradingService(settings)
+
+
 async def _profile_doctor(profile: RuntimeProfile, submission_mode: SubmissionMode | None) -> dict[str, Any]:
     settings = get_settings()
     selected_mode = profile.resolve_submission_mode(submission_mode, default_dry_run=settings.dry_run)
@@ -124,24 +134,6 @@ async def _run_daemon_profile(profile: RuntimeProfile, submission_mode: Submissi
     selected_mode = profile.resolve_submission_mode(submission_mode, default_dry_run=settings.dry_run)
     store = SQLiteStateStore(settings.state_db_path)
 
-    async def _spot() -> dict[str, Any]:
-        daemon = StrategyDaemon(
-            settings=settings,
-            profile=profile,
-            state_store=store,
-            service_factory=lambda: SpotTradingService(settings),
-        )
-        return await daemon.run()
-
-    async def _futures() -> dict[str, Any]:
-        daemon = StrategyDaemon(
-            settings=settings,
-            profile=profile,
-            state_store=store,
-            service_factory=lambda: FuturesTradingService(settings),
-        )
-        return await daemon.run()
-
     if selected_mode != profile.resolve_submission_mode(None, default_dry_run=settings.dry_run):
         profile = RuntimeProfile(
             name=profile.name,
@@ -155,9 +147,33 @@ async def _run_daemon_profile(profile: RuntimeProfile, submission_mode: Submissi
             path=profile.path,
         )
 
-    if profile.market is MarketType.SPOT:
-        return await _spot()
-    return await _futures()
+    daemon = StrategyDaemon(
+        settings=settings,
+        profile=profile,
+        state_store=store,
+        service_factory=_service_factory_for_profile(settings, profile),
+    )
+    return await daemon.run()
+
+
+async def _stack_doctor(stack: RuntimeStack, submission_mode: SubmissionMode | None) -> dict[str, Any]:
+    results = []
+    for profile in stack.profiles:
+        payload = await _profile_doctor(profile, submission_mode)
+        results.append({"profile_name": profile.name, "doctor": payload})
+    return {"runtime_stack": stack.to_dict(), "profiles": results}
+
+
+async def _run_daemon_stack(stack: RuntimeStack) -> dict[str, Any]:
+    settings = get_settings()
+    store = SQLiteStateStore(settings.state_db_path)
+    daemon = StrategyDaemonStack(
+        settings=settings,
+        stack=stack,
+        state_store=store,
+        service_factory_resolver=lambda profile: _service_factory_for_profile(settings, profile),
+    )
+    return await daemon.run()
 
 
 def _runtime_status_payload(service_name: str | None = None) -> dict[str, Any]:
@@ -173,6 +189,21 @@ def _runtime_status_payload(service_name: str | None = None) -> dict[str, Any]:
     for item in statuses:
         item["healthy"] = is_runtime_status_healthy(item)
     return {"services": statuses}
+
+
+def _runtime_stack_status_payload(stack_name: str | None = None) -> dict[str, Any]:
+    settings = get_settings()
+    store = SQLiteStateStore(settings.state_db_path)
+    if stack_name:
+        payload = store.get_runtime_stack_status(stack_name)
+        if payload is None:
+            raise ValueError(f"runtime stack {stack_name!r} was not found")
+        payload["healthy"] = is_runtime_stack_status_healthy(payload)
+        return payload
+    stacks = store.list_runtime_stack_statuses()
+    for item in stacks:
+        item["healthy"] = is_runtime_stack_status_healthy(item)
+    return {"stacks": stacks}
 
 
 @app.command("doctor")
@@ -356,6 +387,12 @@ def show_runtime_profile(path: str = typer.Argument(..., help="Path to a runtime
     _print_json({"runtime_profile": profile.to_dict()})
 
 
+@app.command("show-runtime-stack")
+def show_runtime_stack(path: str = typer.Argument(..., help="Path to a runtime stack TOML or JSON file.")) -> None:
+    stack = _load_runtime_stack(path)
+    _print_json({"runtime_stack": stack.to_dict()})
+
+
 @app.command("doctor-runtime-profile")
 def doctor_runtime_profile(
     path: str = typer.Argument(..., help="Path to a runtime profile TOML or JSON file."),
@@ -366,6 +403,16 @@ def doctor_runtime_profile(
     _run(_profile_doctor(profile, _resolve_mode(live, test_order)))
 
 
+@app.command("doctor-runtime-stack")
+def doctor_runtime_stack(
+    path: str = typer.Argument(..., help="Path to a runtime stack TOML or JSON file."),
+    live: bool = typer.Option(False, "--live", help="Resolve this stack in live mode."),
+    test_order: bool = typer.Option(False, "--test-order", help="Resolve this stack in exchange test mode."),
+) -> None:
+    stack = _load_runtime_stack(path)
+    _run(_stack_doctor(stack, _resolve_mode(live, test_order)))
+
+
 @app.command("run-daemon")
 def run_daemon(
     path: str = typer.Argument(..., help="Path to a runtime profile TOML or JSON file."),
@@ -374,6 +421,14 @@ def run_daemon(
 ) -> None:
     profile = _load_runtime_profile(path)
     _run(_run_daemon_profile(profile, _resolve_mode(live, test_order)))
+
+
+@app.command("run-daemon-stack")
+def run_daemon_stack(
+    path: str = typer.Argument(..., help="Path to a runtime stack TOML or JSON file."),
+) -> None:
+    stack = _load_runtime_stack(path)
+    _run(_run_daemon_stack(stack))
 
 
 @app.command("daemon-status")
@@ -388,6 +443,24 @@ def daemon_health(
     service_name: str = typer.Argument(..., help="Runtime service name."),
 ) -> None:
     payload = _runtime_status_payload(service_name)
+    if not payload.get("healthy", False):
+        _print_json(payload)
+        raise typer.Exit(code=1)
+    _print_json(payload)
+
+
+@app.command("daemon-stack-status")
+def daemon_stack_status(
+    stack_name: str | None = typer.Argument(None, help="Optional runtime stack name. Omit to list all tracked stacks."),
+) -> None:
+    _print_json(_runtime_stack_status_payload(stack_name))
+
+
+@app.command("daemon-stack-health")
+def daemon_stack_health(
+    stack_name: str = typer.Argument(..., help="Runtime stack name."),
+) -> None:
+    payload = _runtime_stack_status_payload(stack_name)
     if not payload.get("healthy", False):
         _print_json(payload)
         raise typer.Exit(code=1)

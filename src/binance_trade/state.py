@@ -87,8 +87,35 @@ class SQLiteStateStore:
                     updated_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS runtime_stack_sessions (
+                    run_id TEXT PRIMARY KEY,
+                    stack_name TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    profile_count INTEGER NOT NULL,
+                    config_json TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    last_heartbeat_at TEXT,
+                    stopped_at TEXT,
+                    reason TEXT,
+                    error_text TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS runtime_stack_status (
+                    stack_name TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    profile_count INTEGER NOT NULL,
+                    healthy_profile_count INTEGER NOT NULL DEFAULT 0,
+                    stale_after_seconds INTEGER NOT NULL DEFAULT 90,
+                    summary_json TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    last_heartbeat_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_runtime_sessions_service_name ON runtime_sessions(service_name);
                 CREATE INDEX IF NOT EXISTS idx_runtime_sessions_started_at ON runtime_sessions(started_at);
+                CREATE INDEX IF NOT EXISTS idx_runtime_stack_sessions_stack_name ON runtime_stack_sessions(stack_name);
                 """
             )
             self._ensure_column(connection, "orders", "market_type", "TEXT NOT NULL DEFAULT 'spot'")
@@ -468,6 +495,160 @@ class SQLiteStateStore:
             ).fetchall()
         return [self._runtime_status_row_to_dict(row) for row in rows]
 
+    def start_runtime_stack_session(
+        self,
+        *,
+        stack_name: str,
+        profile_count: int,
+        stale_after_seconds: int,
+        config: dict[str, Any],
+    ) -> str:
+        run_id = uuid.uuid4().hex
+        now = utc_now_iso()
+        config_json = json_dumps(config)
+        empty_summary = json_dumps({"status": "STARTING", "profile_count": profile_count, "healthy_profile_count": 0})
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO runtime_stack_sessions (
+                    run_id, stack_name, status, profile_count, config_json, started_at, last_heartbeat_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (run_id, stack_name, "STARTING", profile_count, config_json, now, now),
+            )
+            connection.execute(
+                """
+                INSERT INTO runtime_stack_status (
+                    stack_name, run_id, status, profile_count, healthy_profile_count,
+                    stale_after_seconds, summary_json, started_at, last_heartbeat_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(stack_name) DO UPDATE SET
+                    run_id=excluded.run_id,
+                    status=excluded.status,
+                    profile_count=excluded.profile_count,
+                    healthy_profile_count=excluded.healthy_profile_count,
+                    stale_after_seconds=excluded.stale_after_seconds,
+                    summary_json=excluded.summary_json,
+                    started_at=excluded.started_at,
+                    last_heartbeat_at=excluded.last_heartbeat_at,
+                    updated_at=excluded.updated_at
+                """,
+                (stack_name, run_id, "STARTING", profile_count, 0, stale_after_seconds, empty_summary, now, now, now),
+            )
+        return run_id
+
+    def update_runtime_stack_status(
+        self,
+        *,
+        stack_name: str,
+        run_id: str,
+        status: str,
+        profile_count: int,
+        healthy_profile_count: int,
+        stale_after_seconds: int,
+        summary: dict[str, Any],
+    ) -> None:
+        now = utc_now_iso()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE runtime_stack_sessions
+                SET status = ?, last_heartbeat_at = ?
+                WHERE run_id = ?
+                """,
+                (status, now, run_id),
+            )
+            connection.execute(
+                """
+                INSERT INTO runtime_stack_status (
+                    stack_name, run_id, status, profile_count, healthy_profile_count,
+                    stale_after_seconds, summary_json, started_at, last_heartbeat_at, updated_at
+                )
+                VALUES (
+                    ?, ?, ?, ?, ?, ?, ?,
+                    COALESCE((SELECT started_at FROM runtime_stack_status WHERE stack_name = ?), ?),
+                    ?, ?
+                )
+                ON CONFLICT(stack_name) DO UPDATE SET
+                    run_id=excluded.run_id,
+                    status=excluded.status,
+                    profile_count=excluded.profile_count,
+                    healthy_profile_count=excluded.healthy_profile_count,
+                    stale_after_seconds=excluded.stale_after_seconds,
+                    summary_json=excluded.summary_json,
+                    last_heartbeat_at=excluded.last_heartbeat_at,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    stack_name,
+                    run_id,
+                    status,
+                    profile_count,
+                    healthy_profile_count,
+                    stale_after_seconds,
+                    json_dumps(summary),
+                    stack_name,
+                    now,
+                    now,
+                    now,
+                ),
+            )
+
+    def stop_runtime_stack_session(
+        self,
+        *,
+        stack_name: str,
+        run_id: str,
+        status: str,
+        reason: str | None = None,
+        error_text: str | None = None,
+        summary: dict[str, Any] | None = None,
+    ) -> None:
+        now = utc_now_iso()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE runtime_stack_sessions
+                SET status = ?, stopped_at = ?, reason = ?, error_text = ?, last_heartbeat_at = ?
+                WHERE run_id = ?
+                """,
+                (status, now, reason, error_text, now, run_id),
+            )
+            if summary is not None:
+                connection.execute(
+                    """
+                    UPDATE runtime_stack_status
+                    SET status = ?, summary_json = ?, last_heartbeat_at = ?, updated_at = ?
+                    WHERE stack_name = ? AND run_id = ?
+                    """,
+                    (status, json_dumps(summary), now, now, stack_name, run_id),
+                )
+
+    def get_runtime_stack_status(self, stack_name: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT *
+                FROM runtime_stack_status
+                WHERE stack_name = ?
+                """,
+                (stack_name,),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._runtime_stack_status_row_to_dict(row)
+
+    def list_runtime_stack_statuses(self) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM runtime_stack_status
+                ORDER BY updated_at DESC, stack_name ASC
+                """
+            ).fetchall()
+        return [self._runtime_stack_status_row_to_dict(row) for row in rows]
+
     def _runtime_status_row_to_dict(self, row: sqlite3.Row) -> dict[str, Any]:
         return {
             "service_name": str(row["service_name"]),
@@ -481,6 +662,20 @@ class SQLiteStateStore:
             "summary": self._loads_json(row["summary_json"]),
             "ctx_state": self._loads_json(row["ctx_state_json"]),
             "strategy_state": self._loads_json(row["strategy_state_json"]),
+            "started_at": str(row["started_at"]),
+            "last_heartbeat_at": str(row["last_heartbeat_at"]),
+            "updated_at": str(row["updated_at"]),
+        }
+
+    def _runtime_stack_status_row_to_dict(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "stack_name": str(row["stack_name"]),
+            "run_id": str(row["run_id"]),
+            "status": str(row["status"]),
+            "profile_count": int(row["profile_count"]),
+            "healthy_profile_count": int(row["healthy_profile_count"]),
+            "stale_after_seconds": int(row["stale_after_seconds"]),
+            "summary": self._loads_json(row["summary_json"]),
             "started_at": str(row["started_at"]),
             "last_heartbeat_at": str(row["last_heartbeat_at"]),
             "updated_at": str(row["updated_at"]),

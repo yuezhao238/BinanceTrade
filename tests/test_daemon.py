@@ -5,8 +5,8 @@ from pathlib import Path
 import pytest
 
 from binance_trade.config import Settings
-from binance_trade.daemon import StrategyDaemon, is_runtime_status_healthy
-from binance_trade.runtime_profiles import DaemonSettings, RuntimeProfile
+from binance_trade.daemon import StrategyDaemon, StrategyDaemonStack, is_runtime_stack_status_healthy, is_runtime_status_healthy
+from binance_trade.runtime_profiles import DaemonSettings, RuntimeProfile, RuntimeStack, RuntimeStackSettings
 from binance_trade.state import SQLiteStateStore
 from binance_trade.strategy_runtime import StopStrategy, StrategyContext, StrategyEvent
 from binance_trade.types import MarketType, OrderRequest, SubmissionMode
@@ -187,3 +187,61 @@ def test_runtime_health_is_false_for_stopped_payload() -> None:
     }
 
     assert is_runtime_status_healthy(payload) is False
+
+
+def test_daemon_stack_runs_multiple_profiles(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    store = SQLiteStateStore(settings.state_db_path)
+    orders: list[OrderRequest] = []
+    profiles = (
+        RuntimeProfile(
+            name="spot-btc",
+            market=MarketType.SPOT,
+            strategy_ref="ignored",
+            params={"symbol": "BTCUSDT"},
+            daemon=DaemonSettings(auto_restart=False, stop_on_strategy_exit=True),
+        ),
+        RuntimeProfile(
+            name="spot-eth",
+            market=MarketType.SPOT,
+            strategy_ref="ignored",
+            params={"symbol": "ETHUSDT"},
+            daemon=DaemonSettings(auto_restart=False, stop_on_strategy_exit=True),
+        ),
+    )
+    stack = RuntimeStack(
+        name="spot-core",
+        profiles=profiles,
+        settings=RuntimeStackSettings(stop_on_member_exit=False, stop_on_member_failure=True),
+    )
+
+    daemon_stack = StrategyDaemonStack(
+        settings=settings,
+        stack=stack,
+        service_factory_resolver=lambda profile: (lambda: FakeService(orders)),
+        strategy_loader=lambda strategy_ref, params=None: OneShotStrategy(),
+        state_store=store,
+    )
+
+    result = asyncio.run(daemon_stack.run())
+
+    assert result["status"] == "STOPPED"
+    assert result["profile_count"] == 2
+    assert len(orders) == 2
+    stack_status = store.get_runtime_stack_status("spot-core")
+    assert stack_status is not None
+    assert stack_status["status"] == "STOPPED"
+    assert stack_status["profile_count"] == 2
+    assert (settings.runtime_dir / "stack-spot-core.json").exists()
+
+
+def test_runtime_stack_health_is_false_when_not_all_members_are_healthy() -> None:
+    payload = {
+        "status": "RUNNING",
+        "last_heartbeat_at": "2026-04-24T00:00:00+00:00",
+        "stale_after_seconds": 30,
+        "healthy_profile_count": 1,
+        "profile_count": 2,
+    }
+
+    assert is_runtime_stack_status_healthy(payload) is False

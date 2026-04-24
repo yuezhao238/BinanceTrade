@@ -44,6 +44,26 @@ stop_on_strategy_exit = false
 stale_after_seconds = 90
 ```
 
+## Runtime Stack Format
+
+Stacks are TOML or JSON files that reference multiple runtime profiles.
+
+Example:
+
+```toml
+name = "spot-us-core"
+profiles = [
+  "spot_ema_btcusdt.toml",
+  "spot_ema_ethusdt.toml",
+]
+
+[settings]
+heartbeat_interval_seconds = 30
+stale_after_seconds = 90
+stop_on_member_exit = true
+stop_on_member_failure = true
+```
+
 ## Operator Commands
 
 Inspect the profile:
@@ -77,6 +97,32 @@ Use in container healthchecks:
 binance-trade daemon-health spot-ema-btcusdt
 ```
 
+Inspect the stack:
+
+```bash
+binance-trade show-runtime-stack examples/runtime/spot_us_core.toml
+```
+
+Check every member profile in the stack:
+
+```bash
+binance-trade doctor-runtime-stack examples/runtime/spot_us_core.toml
+```
+
+Run the stack:
+
+```bash
+binance-trade run-daemon-stack examples/runtime/spot_us_core.toml
+```
+
+Inspect stack-level health:
+
+```bash
+binance-trade daemon-stack-status
+binance-trade daemon-stack-status spot-us-core
+binance-trade daemon-stack-health spot-us-core
+```
+
 ## Runtime State
 
 The daemon writes to two places:
@@ -87,12 +133,19 @@ The daemon writes to two places:
 - `RUNTIME_DIR/<service-name>.json`
   - current heartbeat snapshot for simple process monitors
 
+The stack supervisor adds:
+
+- `runtime_stack_sessions`
+- `runtime_stack_status`
+- `RUNTIME_DIR/stack-<stack-name>.json`
+
 ## Promotion Path
 
 1. Research with `backtest-*`, `benchmark-builtin-strategies`, and `walkforward-*`.
 2. Move the chosen idea into a persistent custom strategy.
 3. Wrap it in a runtime profile.
 4. Validate with `doctor-runtime-profile`.
-5. Run under `run-daemon` with `DRY_RUN=true`.
-6. Move to test orders.
-7. Move to live with small size.
+5. Choose whether to deploy one profile or a stack of profiles.
+6. Run under `run-daemon` or `run-daemon-stack` with `DRY_RUN=true`.
+7. Move to test orders.
+8. Move to live with small size.

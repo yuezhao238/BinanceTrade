@@ -7,7 +7,7 @@ import signal
 from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Protocol
+from typing import Any, Callable, Protocol
 
 from .config import Settings
 from .state import SQLiteStateStore
@@ -40,6 +40,22 @@ def is_runtime_status_healthy(payload: dict[str, Any], *, now: datetime | None =
     return age_seconds <= stale_after_seconds
 
 
+def is_runtime_stack_status_healthy(payload: dict[str, Any], *, now: datetime | None = None) -> bool:
+    status = str(payload.get("status", "")).upper()
+    if status not in {"STARTING", "RUNNING"}:
+        return False
+    heartbeat_text = payload.get("last_heartbeat_at")
+    if not heartbeat_text:
+        return False
+    stale_after_seconds = int(payload.get("stale_after_seconds", 90))
+    current_time = now or datetime.now(UTC)
+    heartbeat_time = datetime.fromisoformat(str(heartbeat_text))
+    age_seconds = (current_time - heartbeat_time).total_seconds()
+    if age_seconds > stale_after_seconds:
+        return False
+    return int(payload.get("healthy_profile_count", 0)) >= int(payload.get("profile_count", 0))
+
+
 class StrategyDaemon:
     def __init__(
         self,
@@ -49,18 +65,21 @@ class StrategyDaemon:
         service_factory: ServiceFactory,
         strategy_loader: StrategyLoader = load_strategy,
         state_store: SQLiteStateStore | None = None,
+        install_signal_handlers: bool = True,
     ) -> None:
         self.settings = settings
         self.profile = profile
         self.service_factory = service_factory
         self.strategy_loader = strategy_loader
         self.state_store = state_store or SQLiteStateStore(settings.state_db_path)
+        self.install_signal_handlers = install_signal_handlers
         self.stop_event = asyncio.Event()
         self._last_reconcile_summary: dict[str, Any] | None = None
         self._last_error: str | None = None
 
     async def run(self) -> dict[str, Any]:
-        self._install_signal_handlers()
+        if self.install_signal_handlers:
+            self._install_signal_handlers()
 
         restart_count = 0
         restart_delay = self.profile.daemon.restart_initial_delay_seconds
@@ -447,6 +466,261 @@ class StrategyDaemon:
 
     def _status_file_path(self) -> Path:
         return self.settings.runtime_dir / f"{self.profile.name}.json"
+
+
+class StrategyDaemonStack:
+    def __init__(
+        self,
+        *,
+        settings: Settings,
+        stack: Any,
+        service_factory_resolver: Callable[[Any], ServiceFactory],
+        strategy_loader: StrategyLoader = load_strategy,
+        state_store: SQLiteStateStore | None = None,
+        install_signal_handlers: bool = True,
+    ) -> None:
+        self.settings = settings
+        self.stack = stack
+        self.service_factory_resolver = service_factory_resolver
+        self.strategy_loader = strategy_loader
+        self.state_store = state_store or SQLiteStateStore(settings.state_db_path)
+        self.install_signal_handlers = install_signal_handlers
+        self.stop_event = asyncio.Event()
+
+    async def run(self) -> dict[str, Any]:
+        if self.install_signal_handlers:
+            self._install_signal_handlers()
+
+        run_id = self.state_store.start_runtime_stack_session(
+            stack_name=self.stack.name,
+            profile_count=len(self.stack.profiles),
+            stale_after_seconds=self.stack.settings.stale_after_seconds,
+            config=self.stack.to_dict(),
+        )
+        daemons = {
+            profile.name: StrategyDaemon(
+                settings=self.settings,
+                profile=profile,
+                service_factory=self.service_factory_resolver(profile),
+                strategy_loader=self.strategy_loader,
+                state_store=self.state_store,
+                install_signal_handlers=False,
+            )
+            for profile in self.stack.profiles
+        }
+        member_results: dict[str, dict[str, Any]] = {}
+        tasks = {name: asyncio.create_task(daemon.run(), name=f"{name}-stack-member") for name, daemon in daemons.items()}
+        heartbeat_task = asyncio.create_task(self._heartbeat_loop(run_id=run_id, member_results=member_results), name=f"{self.stack.name}-heartbeat")
+        stop_task = asyncio.create_task(self.stop_event.wait(), name=f"{self.stack.name}-stop")
+
+        try:
+            self._persist_stack_status(run_id=run_id, status="RUNNING", member_results=member_results)
+            while tasks:
+                watched = set(tasks.values()) | {heartbeat_task, stop_task}
+                done, _ = await asyncio.wait(watched, return_when=asyncio.FIRST_COMPLETED)
+
+                if stop_task in done and self.stop_event.is_set():
+                    await self._stop_member_tasks(daemons, tasks)
+                    summary = self._build_stack_summary(
+                        run_id=run_id,
+                        status="STOPPED",
+                        member_results=member_results,
+                        reason="shutdown requested",
+                    )
+                    self.state_store.stop_runtime_stack_session(
+                        stack_name=self.stack.name,
+                        run_id=run_id,
+                        status="STOPPED",
+                        reason="shutdown requested",
+                        summary=summary,
+                    )
+                    self._write_status_file(summary)
+                    return summary
+
+                if heartbeat_task in done:
+                    exc = heartbeat_task.exception()
+                    raise RuntimeError("stack heartbeat stopped unexpectedly") if exc is None else exc
+
+                completed_members = [name for name, task in tasks.items() if task in done]
+                for name in completed_members:
+                    task = tasks.pop(name)
+                    exc = task.exception()
+                    if exc is not None:
+                        member_results[name] = {"status": "FAILED", "error": str(exc)}
+                        self._persist_stack_status(run_id=run_id, status="FAILED", member_results=member_results, error_text=str(exc))
+                        if self.stack.settings.stop_on_member_failure:
+                            await self._stop_member_tasks(daemons, tasks)
+                            summary = self._build_stack_summary(
+                                run_id=run_id,
+                                status="FAILED",
+                                member_results=member_results,
+                                reason=f"member failed: {name}",
+                                error_text=str(exc),
+                            )
+                            self.state_store.stop_runtime_stack_session(
+                                stack_name=self.stack.name,
+                                run_id=run_id,
+                                status="FAILED",
+                                reason=f"member failed: {name}",
+                                error_text=str(exc),
+                                summary=summary,
+                            )
+                            self._write_status_file(summary)
+                            raise RuntimeError(f"runtime stack {self.stack.name} failed because {name} failed: {exc}") from exc
+                    else:
+                        result = task.result()
+                        member_results[name] = result
+                        self._persist_stack_status(run_id=run_id, status="RUNNING", member_results=member_results)
+                        if self.stack.settings.stop_on_member_exit:
+                            await self._stop_member_tasks(daemons, tasks)
+                            summary = self._build_stack_summary(
+                                run_id=run_id,
+                                status="STOPPED",
+                                member_results=member_results,
+                                reason=f"member exited: {name}",
+                            )
+                            self.state_store.stop_runtime_stack_session(
+                                stack_name=self.stack.name,
+                                run_id=run_id,
+                                status="STOPPED",
+                                reason=f"member exited: {name}",
+                                summary=summary,
+                            )
+                            self._write_status_file(summary)
+                            return summary
+
+                if tasks:
+                    self._persist_stack_status(run_id=run_id, status="RUNNING", member_results=member_results)
+
+            summary = self._build_stack_summary(
+                run_id=run_id,
+                status="STOPPED",
+                member_results=member_results,
+                reason="all members exited",
+            )
+            self.state_store.stop_runtime_stack_session(
+                stack_name=self.stack.name,
+                run_id=run_id,
+                status="STOPPED",
+                reason="all members exited",
+                summary=summary,
+            )
+            self._write_status_file(summary)
+            return summary
+        finally:
+            heartbeat_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await heartbeat_task
+
+    def request_stop(self) -> None:
+        self.stop_event.set()
+
+    async def _heartbeat_loop(self, *, run_id: str, member_results: dict[str, dict[str, Any]]) -> None:
+        while True:
+            await asyncio.sleep(self.stack.settings.heartbeat_interval_seconds)
+            self._persist_stack_status(run_id=run_id, status="RUNNING", member_results=member_results)
+
+    async def _stop_member_tasks(self, daemons: dict[str, StrategyDaemon], tasks: dict[str, asyncio.Task[dict[str, Any]]]) -> None:
+        for daemon in daemons.values():
+            daemon.request_stop()
+        if not tasks:
+            return
+        done, pending = await asyncio.wait(set(tasks.values()), timeout=5)
+        for task in done:
+            with suppress(asyncio.CancelledError):
+                await task
+        for task in pending:
+            task.cancel()
+        for task in pending:
+            with suppress(asyncio.CancelledError):
+                await task
+
+    def _persist_stack_status(
+        self,
+        *,
+        run_id: str,
+        status: str,
+        member_results: dict[str, dict[str, Any]],
+        reason: str | None = None,
+        error_text: str | None = None,
+    ) -> None:
+        summary = self._build_stack_summary(
+            run_id=run_id,
+            status=status,
+            member_results=member_results,
+            reason=reason,
+            error_text=error_text,
+        )
+        healthy_profile_count = sum(1 for item in summary["members"].values() if item.get("healthy"))
+        self.state_store.update_runtime_stack_status(
+            stack_name=self.stack.name,
+            run_id=run_id,
+            status=status,
+            profile_count=len(self.stack.profiles),
+            healthy_profile_count=healthy_profile_count,
+            stale_after_seconds=self.stack.settings.stale_after_seconds,
+            summary=summary,
+        )
+        self._write_status_file(summary)
+
+    def _build_stack_summary(
+        self,
+        *,
+        run_id: str,
+        status: str,
+        member_results: dict[str, dict[str, Any]],
+        reason: str | None = None,
+        error_text: str | None = None,
+    ) -> dict[str, Any]:
+        members: dict[str, Any] = {}
+        healthy_profile_count = 0
+        for profile in self.stack.profiles:
+            runtime_status = self.state_store.get_runtime_status(profile.name)
+            member_payload: dict[str, Any] = {
+                "market": profile.market.value,
+                "profile_path": None if profile.path is None else str(profile.path),
+                "strategy_ref": profile.strategy_ref,
+            }
+            if runtime_status is not None:
+                member_payload.update(runtime_status)
+                member_payload["healthy"] = is_runtime_status_healthy(runtime_status)
+            else:
+                member_payload["status"] = "UNKNOWN"
+                member_payload["healthy"] = False
+            if profile.name in member_results:
+                member_payload["result"] = _safe_json_value(member_results[profile.name])
+            if member_payload["healthy"]:
+                healthy_profile_count += 1
+            members[profile.name] = member_payload
+
+        payload: dict[str, Any] = {
+            "stack_name": self.stack.name,
+            "status": status,
+            "run_id": run_id,
+            "profile_count": len(self.stack.profiles),
+            "healthy_profile_count": healthy_profile_count,
+            "stack_path": None if self.stack.path is None else str(self.stack.path),
+            "updated_at": utc_now_iso(),
+            "members": members,
+        }
+        if reason:
+            payload["reason"] = reason
+        if error_text:
+            payload["error"] = error_text
+        return payload
+
+    def _install_signal_handlers(self) -> None:
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            with suppress(NotImplementedError):
+                loop.add_signal_handler(sig, self.request_stop)
+
+    def _write_status_file(self, payload: dict[str, Any]) -> None:
+        self.settings.runtime_dir.mkdir(parents=True, exist_ok=True)
+        self._status_file_path().write_text(json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True), encoding="utf-8")
+
+    def _status_file_path(self) -> Path:
+        return self.settings.runtime_dir / f"stack-{self.stack.name}.json"
 
 
 def _summarize_reconcile_payload(payload: dict[str, Any]) -> dict[str, Any]:

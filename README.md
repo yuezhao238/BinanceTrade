@@ -182,6 +182,7 @@ The included reference pair is:
 
 - strategy: [spot_ema_persistent.py](/Users/zhaoyue/Documents/Works/Playground/BinanceTrade/examples/strategies/spot_ema_persistent.py:1)
 - profile: [spot_ema_btcusdt.toml](/Users/zhaoyue/Documents/Works/Playground/BinanceTrade/examples/runtime/spot_ema_btcusdt.toml:1)
+- stack: [spot_us_core.toml](/Users/zhaoyue/Documents/Works/Playground/BinanceTrade/examples/runtime/spot_us_core.toml:1)
 
 Validate and run it:
 
@@ -191,12 +192,23 @@ binance-trade doctor-runtime-profile examples/runtime/spot_ema_btcusdt.toml
 binance-trade run-daemon examples/runtime/spot_ema_btcusdt.toml
 ```
 
+Or run multiple profiles as one supervised stack:
+
+```bash
+binance-trade show-runtime-stack examples/runtime/spot_us_core.toml
+binance-trade doctor-runtime-stack examples/runtime/spot_us_core.toml
+binance-trade run-daemon-stack examples/runtime/spot_us_core.toml
+```
+
 Inspect daemon health:
 
 ```bash
 binance-trade daemon-status
 binance-trade daemon-status spot-ema-btcusdt
 binance-trade daemon-health spot-ema-btcusdt
+binance-trade daemon-stack-status
+binance-trade daemon-stack-status spot-us-core
+binance-trade daemon-stack-health spot-us-core
 ```
 
 The operational model is documented in [runtime_operations.md](/Users/zhaoyue/Documents/Works/Playground/BinanceTrade/docs/runtime_operations.md:1).
@@ -602,21 +614,21 @@ Build:
 docker build -t binance-trade .
 ```
 
-Validate the profile locally:
+Validate the stack locally:
 
 ```bash
 docker run --rm --env-file .env -v "$(pwd)/var:/app/var" -v "$(pwd)/examples:/app/examples:ro" \
-  binance-trade binance-trade doctor-runtime-profile examples/runtime/spot_ema_btcusdt.toml
+  binance-trade binance-trade doctor-runtime-stack examples/runtime/spot_us_core.toml
 ```
 
-Run the supervised daemon:
+Run the supervised stack daemon:
 
 ```bash
 docker run -d --name binance-trader --restart unless-stopped \
   --env-file .env \
   -v "$(pwd)/var:/app/var" \
   -v "$(pwd)/examples:/app/examples:ro" \
-  binance-trade binance-trade run-daemon examples/runtime/spot_ema_btcusdt.toml
+  binance-trade binance-trade run-daemon-stack examples/runtime/spot_us_core.toml
 ```
 
 Or use Compose:
