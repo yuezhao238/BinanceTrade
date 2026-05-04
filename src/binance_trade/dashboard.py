@@ -130,6 +130,17 @@ def _series_return_pct(values: list[float]) -> float | None:
     return round(((float(values[-1]) / base) - 1) * 100, 4)
 
 
+def _is_stopped_status(value: Any) -> bool:
+    return str(value or "").upper() in {"STOPPED", "ALREADY_STOPPED"}
+
+
+def _is_hidden_runtime_status(item: dict[str, Any]) -> bool:
+    status = str(item.get("status") or "").upper()
+    if _is_stopped_status(status):
+        return True
+    return status == "RESTARTING" and not is_runtime_status_healthy(item)
+
+
 @dataclass(slots=True)
 class DashboardConfig:
     host: str = "127.0.0.1"
@@ -167,9 +178,12 @@ class DashboardDataService:
 
     def build_snapshot(self) -> dict[str, Any]:
         raw_services = self.state_store.list_runtime_statuses()
-        services = [self._service_card(item) for item in raw_services]
+        visible_raw_services = [item for item in raw_services if not _is_hidden_runtime_status(item)]
+        services = [self._service_card(item) for item in visible_raw_services]
         strategy_charts = [chart for item in raw_services if (chart := self._strategy_chart(item)) is not None]
-        stacks = [self._stack_card(item) for item in self.state_store.list_runtime_stack_statuses()]
+        raw_stacks = self.state_store.list_runtime_stack_statuses()
+        visible_raw_stacks = [item for item in raw_stacks if not _is_stopped_status(item.get("status"))]
+        stacks = [self._stack_card(item) for item in visible_raw_stacks]
         orders = [self._order_row(item) for item in self.state_store.list_orders(limit=self.config.order_limit)]
         events = [self._event_row(item) for item in self.state_store.list_events(limit=self.config.event_limit)]
         portfolio = self._portfolio_section() if self.config.include_portfolio else {"enabled": False}
@@ -202,6 +216,8 @@ class DashboardDataService:
                 "order_count": len(orders),
                 "open_order_count": sum(1 for item in orders if item["is_open"]),
                 "event_count": len(events),
+                "stopped_stack_count": len(raw_stacks) - len(visible_raw_stacks),
+                "stopped_service_count": len(raw_services) - len(visible_raw_services),
             },
             "stacks": stacks,
             "services": services,
@@ -327,6 +343,8 @@ class DashboardDataService:
         }
 
     def _strategy_chart(self, item: dict[str, Any]) -> dict[str, Any] | None:
+        if str(item.get("status", "")).upper() != "RUNNING" or not is_runtime_status_healthy(item):
+            return None
         strategy_state = item.get("strategy_state") or {}
         raw_candles = strategy_state.get("candles")
         if not isinstance(raw_candles, list) or len(raw_candles) < 2:
@@ -412,11 +430,12 @@ class DashboardDataService:
         if isinstance(raw_members, dict):
             for name, member in raw_members.items():
                 member_summary = member.get("summary") or {}
+                member_healthy = is_runtime_status_healthy(member)
                 members.append(
                     {
                         "service_name": name,
                         "status": member.get("status"),
-                        "healthy": bool(member.get("healthy")),
+                        "healthy": member_healthy,
                         "restart_count": member.get("restart_count"),
                         "updated_at": member.get("updated_at"),
                         "error": member_summary.get("error"),
@@ -563,6 +582,8 @@ class DashboardDataService:
                         "error": str(exc),
                     }
                 )
+                continue
+            if _is_hidden_runtime_status(payload):
                 continue
             rows.append(
                 {
@@ -892,6 +913,7 @@ class DashboardDataService:
 class DashboardControlPlane:
     def __init__(self, settings: Settings, *, workspace_root: Path | None = None) -> None:
         self.settings = settings
+        self.state_store = SQLiteStateStore(settings.state_db_path)
         self.workspace_root = (workspace_root or Path.cwd()).resolve()
         self.runtime_examples_dir = self.workspace_root / "examples" / "runtime"
         self.generated_runtime_dir = settings.runtime_dir / "generated"
@@ -1097,7 +1119,19 @@ class DashboardControlPlane:
             os.kill(pid, 0)
         except OSError:
             return False
-        return True
+        try:
+            result = subprocess.run(
+                ["ps", "-p", str(pid), "-o", "stat="],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=1,
+            )
+        except Exception:
+            return True
+        if result.returncode != 0:
+            return False
+        return "Z" not in result.stdout.strip()
 
     def _start_process(self, *, kind: str, name: str, path: Path, command: list[str]) -> dict[str, Any]:
         metadata_path = self._metadata_path(kind=kind, name=name)
@@ -1174,10 +1208,15 @@ class DashboardControlPlane:
         return result
 
     def _stop_stack(self, stack_name: str, *, path: Any = None) -> dict[str, Any]:
+        stack = None
         if path:
             resolved = self._resolve_path(str(path))
-            stack_name = load_runtime_stack(resolved).name
-        return self._stop_process(kind="stack", name=stack_name)
+            stack = load_runtime_stack(resolved)
+            stack_name = stack.name
+        result = self._stop_process(kind="stack", name=stack_name)
+        if stack is not None and result.get("status") in {"STOPPED", "ALREADY_STOPPED", "NOT_FOUND"}:
+            self._mark_stack_stopped(stack, reason=str(result.get("status") or "stop requested"))
+        return result
 
     def _start_profile(self, path: str) -> dict[str, Any]:
         resolved = self._resolve_path(path)
@@ -1186,10 +1225,97 @@ class DashboardControlPlane:
         return self._start_process(kind="profile", name=profile.name, path=resolved, command=command)
 
     def _stop_profile(self, profile_name: str, *, path: Any = None) -> dict[str, Any]:
+        profile = None
         if path:
             resolved = self._resolve_path(str(path))
-            profile_name = load_runtime_profile(resolved).name
-        return self._stop_process(kind="profile", name=profile_name)
+            profile = load_runtime_profile(resolved)
+            profile_name = profile.name
+        result = self._stop_process(kind="profile", name=profile_name)
+        if profile is not None and result.get("status") in {"STOPPED", "ALREADY_STOPPED", "NOT_FOUND"}:
+            self._mark_profile_stopped(profile, reason=str(result.get("status") or "stop requested"))
+        return result
+
+    def _mark_stack_stopped(self, stack: RuntimeStack, *, reason: str) -> None:
+        for profile in stack.profiles:
+            self._mark_profile_stopped(profile, reason=reason)
+
+        existing = self.state_store.get_runtime_stack_status(stack.name) or {}
+        run_id = str(existing.get("run_id") or "dashboard-stop")
+        members = {}
+        for profile in stack.profiles:
+            runtime_status = self.state_store.get_runtime_status(profile.name)
+            if runtime_status is None:
+                members[profile.name] = {
+                    "status": "STOPPED",
+                    "healthy": False,
+                    "market": profile.market.value,
+                    "profile_path": None if profile.path is None else str(profile.path),
+                    "strategy_ref": profile.strategy_ref,
+                    "reason": reason,
+                }
+            else:
+                members[profile.name] = {**runtime_status, "status": "STOPPED", "healthy": False, "reason": reason}
+        summary = {
+            "stack_name": stack.name,
+            "status": "STOPPED",
+            "run_id": run_id,
+            "profile_count": len(stack.profiles),
+            "healthy_profile_count": 0,
+            "stack_path": None if stack.path is None else str(stack.path),
+            "updated_at": utc_now_iso(),
+            "reason": reason,
+            "members": members,
+        }
+        self.state_store.update_runtime_stack_status(
+            stack_name=stack.name,
+            run_id=run_id,
+            status="STOPPED",
+            profile_count=len(stack.profiles),
+            healthy_profile_count=0,
+            stale_after_seconds=stack.settings.stale_after_seconds,
+            summary=summary,
+        )
+        (self.settings.runtime_dir / f"stack-{stack.name}.json").write_text(
+            json.dumps(summary, ensure_ascii=True, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+
+    def _mark_profile_stopped(self, profile: RuntimeProfile, *, reason: str) -> None:
+        existing = self.state_store.get_runtime_status(profile.name)
+        if existing is None:
+            return
+        summary = dict(existing.get("summary") or {})
+        summary.update(
+            {
+                "service_name": profile.name,
+                "status": "STOPPED",
+                "market": profile.market.value,
+                "strategy_ref": profile.strategy_ref,
+                "run_id": existing.get("run_id"),
+                "restart_count": existing.get("restart_count", 0),
+                "profile_path": None if profile.path is None else str(profile.path),
+                "submission_mode": existing.get("submission_mode"),
+                "updated_at": utc_now_iso(),
+                "reason": reason,
+            }
+        )
+        self.state_store.update_runtime_status(
+            service_name=profile.name,
+            run_id=str(existing.get("run_id") or "dashboard-stop"),
+            market_type=MarketType(str(existing.get("market_type") or profile.market.value)),
+            strategy_ref=str(existing.get("strategy_ref") or profile.strategy_ref),
+            submission_mode=SubmissionMode(str(existing.get("submission_mode") or profile.resolve_submission_mode(None, default_dry_run=self.settings.dry_run).value)),
+            status="STOPPED",
+            restart_count=int(existing.get("restart_count") or 0),
+            stale_after_seconds=profile.daemon.stale_after_seconds,
+            summary=summary,
+            ctx_state=existing.get("ctx_state"),
+            strategy_state=existing.get("strategy_state"),
+        )
+        (self.settings.runtime_dir / f"{profile.name}.json").write_text(
+            json.dumps(summary, ensure_ascii=True, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
 
     def _apply_budget_overrides(self, *, stack: RuntimeStack, budget_overrides: Any) -> list[dict[str, Any]]:
         if not isinstance(budget_overrides, dict):
@@ -1860,11 +1986,12 @@ class DashboardControlPlane:
                     f"exposure {metrics.get('exposure_pct', 0)}% · turnover {metrics.get('turnover_multiple', 0)}x"
                 ),
                 "window_scope": (
-                    f"Displayed chart shows the most recent {window_bars} bars only. "
-                    "B/S markers and the mini equity curve belong to this window."
+                    f"Recent window is a secondary zoom of the last {window_bars} bars only. "
+                    "Do not use it as the primary performance view."
                 ),
                 "full_scope": (
-                    f"Full sample view shows the complete simulated path across {full_bars} bars."
+                    f"Displayed chart shows the complete simulated path across {full_bars} bars. "
+                    "B/S markers and the mini equity curve cover the same full sample."
                 ),
                 "metric_scope": (
                     "Return, drawdown, Sharpe, win rate, and profit factor summarize the full simulated sample."
@@ -2296,6 +2423,44 @@ DASHBOARD_TEMPLATE = """<!doctype html>
       display: block;
       margin-bottom: 2px;
     }
+    .runtime-status-layout {
+      display: grid;
+      gap: 12px;
+    }
+    .runtime-stack-card {
+      padding: 14px;
+      border-radius: 16px;
+      border: 1px solid var(--line);
+      background: rgba(11,16,24,0.72);
+    }
+    .runtime-stack-summary {
+      display: grid;
+      grid-template-columns: minmax(260px, 1fr) repeat(4, minmax(120px, 0.5fr));
+      gap: 10px;
+      align-items: center;
+      margin-bottom: 12px;
+    }
+    .runtime-member-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(360px, 1fr));
+      gap: 10px;
+    }
+    .runtime-member-card {
+      padding: 12px;
+      border-radius: 14px;
+      border: 1px solid var(--line);
+      background: rgba(7,12,19,0.72);
+    }
+    .runtime-member-card .meta-grid {
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 7px 10px;
+      font-size: 12px;
+    }
+    .runtime-note {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
     .wallet-bars {
       display: grid;
       gap: 10px;
@@ -2484,9 +2649,9 @@ DASHBOARD_TEMPLATE = """<!doctype html>
     }
     .deployment-param-grid {
       display: grid;
-      gap: 8px;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
-      margin-top: 10px;
+      gap: 7px;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      margin-top: 0;
     }
     .deployment-param-grid label {
       min-width: 0;
@@ -2496,42 +2661,115 @@ DASHBOARD_TEMPLATE = """<!doctype html>
     }
     .deployment-layout {
       align-items: start;
-      grid-template-columns: 1.1fr 0.9fr;
+      grid-template-columns: minmax(720px, 1.35fr) minmax(320px, 0.65fr);
     }
     .deployment-profile-grid {
       display: grid;
-      gap: 10px;
-      margin-top: 4px;
+      gap: 8px;
+      margin-top: 8px;
     }
     .deployment-profile-row {
-      padding: 12px;
-      border-radius: 16px;
+      display: grid;
+      grid-template-columns: minmax(240px, 1.2fr) minmax(120px, 0.45fr) minmax(360px, 1.8fr) auto;
+      gap: 10px;
+      align-items: end;
+      padding: 10px;
+      border-radius: 14px;
       border: 1px solid var(--line);
-      background: rgba(255,255,255,0.74);
+      background:
+        linear-gradient(90deg, rgba(84,240,200,0.055), transparent 34%),
+        rgba(7,12,19,0.84);
     }
     .deployment-profile-head {
       display: flex;
       justify-content: space-between;
       gap: 10px;
-      align-items: start;
-      margin-bottom: 8px;
+      align-items: center;
+      margin-bottom: 0;
+      min-width: 0;
+    }
+    .deployment-profile-title {
+      min-width: 0;
+    }
+    .deployment-profile-title strong {
+      display: block;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }
     .deployment-profile-meta {
       display: grid;
       grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 8px 10px;
-      font-size: 13px;
-      margin-top: 8px;
+      gap: 4px 8px;
+      font-size: 12px;
+      margin-top: 0;
     }
     .deployment-profile-meta span {
       color: var(--muted);
       display: block;
-      margin-bottom: 2px;
+      margin-bottom: 1px;
+      font-size: 11px;
+    }
+    .deployment-profile-budget,
+    .deployment-profile-actions {
+      min-width: 0;
+    }
+    .deployment-profile-budget label,
+    .deployment-param-grid label {
+      display: grid;
+      gap: 4px;
+      font-family: var(--mono);
+      font-size: 11px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+    .deployment-profile-budget input,
+    .deployment-param-grid input {
+      width: 100%;
+      min-width: 0;
+      padding: 8px 9px;
+      border-radius: 9px;
+      border: 1px solid var(--line);
+      background: rgba(5,9,14,0.92);
+      color: var(--ink);
+      font: 12px var(--mono);
+    }
+    .deployment-profile-actions {
+      display: grid;
+      gap: 6px;
+      justify-items: end;
+    }
+    .deployment-profile-actions .ops-row {
+      justify-content: flex-end;
+    }
+    .deployment-profile-actions button {
+      padding: 8px 10px;
+      border-radius: 9px;
+      font-size: 12px;
+    }
+    .deployment-profile-note {
+      max-width: 220px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      text-align: right;
     }
     .live-overview-grid {
       display: grid;
-      gap: 10px;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+      grid-template-columns: 1fr;
+    }
+    #liveOverviewPanel {
+      position: sticky;
+      top: 14px;
+    }
+    #liveOverviewPanel .mini-metric {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      gap: 12px;
+      padding: 10px 12px;
     }
     .advanced-details > summary {
       cursor: pointer;
@@ -2604,14 +2842,38 @@ DASHBOARD_TEMPLATE = """<!doctype html>
     }
     .research-layout {
       display: grid;
-      gap: 16px;
-      grid-template-columns: 360px 1fr;
+      gap: 14px;
+      grid-template-columns: 1fr;
+      align-items: start;
     }
     .research-block {
       padding: 16px;
       border-radius: 18px;
       border: 1px solid var(--line);
       background: rgba(11,16,24,0.72);
+    }
+    .research-scan-form {
+      display: grid;
+      gap: 10px;
+      grid-template-columns: repeat(6, minmax(120px, 1fr));
+      align-items: end;
+    }
+    .research-scan-form label {
+      min-width: 0;
+    }
+    .research-scan-form .wide-input {
+      grid-column: span 2;
+    }
+    .research-scan-form .research-actions {
+      grid-column: span 2;
+      align-self: end;
+    }
+    .research-scan-form .research-hint {
+      grid-column: 1 / -1;
+    }
+    .research-results-flow {
+      display: grid;
+      gap: 14px;
     }
     .research-summary-grid,
     .candidate-metrics {
@@ -2635,7 +2897,7 @@ DASHBOARD_TEMPLATE = """<!doctype html>
       display: grid;
       gap: 14px;
       grid-template-columns: repeat(2, minmax(0, 1fr));
-      margin-top: 16px;
+      margin-top: 0;
     }
     .candidate-card {
       padding: 16px;
@@ -2643,13 +2905,19 @@ DASHBOARD_TEMPLATE = """<!doctype html>
       border: 1px solid var(--line);
       background: rgba(11,16,24,0.74);
     }
+    .candidate-card .candidate-metrics {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
     .candidate-chart-wrap {
       margin-top: 12px;
       border-radius: 16px;
       border: 1px solid var(--line);
       background:
-        linear-gradient(180deg, rgba(211,155,42,0.06), transparent 45%),
-        linear-gradient(180deg, rgba(16,23,32,0.98), rgba(10,15,22,0.88));
+        linear-gradient(rgba(84,240,200,0.05) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(84,240,200,0.05) 1px, transparent 1px),
+        linear-gradient(180deg, rgba(84,240,200,0.08), transparent 45%),
+        linear-gradient(180deg, rgba(3,8,14,0.98), rgba(6,12,20,0.94));
+      background-size: 32px 32px, 32px 32px, auto, auto;
       overflow: hidden;
     }
     .candidate-chart-svg {
@@ -2799,6 +3067,16 @@ DASHBOARD_TEMPLATE = """<!doctype html>
       .deployment-layout,
       .research-layout,
       .chart-grid { grid-template-columns: 1fr; }
+      .runtime-stack-summary { grid-template-columns: 1fr 1fr; }
+      .runtime-member-grid { grid-template-columns: 1fr; }
+      .research-scan-form { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .research-scan-form .wide-input,
+      .research-scan-form .research-actions { grid-column: span 2; }
+      .candidate-card .candidate-metrics { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+      .deployment-profile-row { grid-template-columns: 1fr; align-items: stretch; }
+      .deployment-profile-actions { justify-items: start; }
+      .deployment-profile-actions .ops-row { justify-content: flex-start; }
+      .deployment-profile-note { max-width: 100%; text-align: left; }
       .candidate-grid,
       .catalog-grid { grid-template-columns: 1fr; }
     }
@@ -2806,6 +3084,10 @@ DASHBOARD_TEMPLATE = """<!doctype html>
       .shell { width: min(100vw - 20px, 100%); margin: 12px auto 28px; }
       .summary-grid, .split, .chart-meta, .research-summary-grid, .candidate-metrics { grid-template-columns: 1fr; }
       .readiness-strip, .deployment-param-grid { grid-template-columns: 1fr; }
+      .research-scan-form,
+      .research-scan-form .wide-input,
+      .research-scan-form .research-actions,
+      .candidate-card .candidate-metrics { grid-template-columns: 1fr; grid-column: auto; }
       .ops-grid { grid-template-columns: 1fr; }
     }
   </style>
@@ -2846,20 +3128,12 @@ DASHBOARD_TEMPLATE = """<!doctype html>
         <div class="readiness-strip" id="readinessStrip"></div>
       </section>
 
-      <section class="panel" data-panel="status">
+      <section class="panel wide" data-panel="status">
         <div class="toolbar">
-          <h2 data-i18n="stacks.title">Stacks</h2>
+          <h2 data-i18n="stacks.title">Runtime</h2>
           <div class="subtle" id="environmentLabel"></div>
         </div>
-        <div class="list" id="stackList"></div>
-      </section>
-
-      <section class="panel" data-panel="status">
-        <div class="toolbar">
-          <h2 data-i18n="services.title">Services</h2>
-          <div class="subtle" data-i18n="services.subtitle">Daemon members and latest heartbeat</div>
-        </div>
-        <div class="list" id="serviceList"></div>
+        <div class="runtime-status-layout" id="runtimeList"></div>
       </section>
 
       <section class="panel wide" data-panel="automation">
@@ -2884,6 +3158,7 @@ DASHBOARD_TEMPLATE = """<!doctype html>
                 <button type="button" onclick="applySuggestedBudgets()" data-i18n="deployment.useSuggested">Use Historical Defaults</button>
                 <button type="button" onclick="startLiveDeployment()" data-i18n="deployment.start">Start Daemon</button>
                 <button type="button" onclick="stopLiveDeployment()" data-i18n="deployment.stop">Stop Stack</button>
+                <button type="button" onclick="switchPanel('research')" data-i18n="deployment.openLab">Open Strategy Lab</button>
               </div>
               <div class="subtle" id="deploymentHint" data-i18n="deployment.hint">Each budget is editable. The default suggestion is computed from recent historical replay for the profile when possible.</div>
             </div>
@@ -2912,15 +3187,16 @@ DASHBOARD_TEMPLATE = """<!doctype html>
         <div class="response-box" id="actionResponse"><h3 data-i18n="advanced.actionCenter">Action Center</h3><div class="subtle" data-i18n="advanced.actionEmpty">No control action executed yet.</div></div>
       </section>
 
-      <section class="panel wide" data-panel="automation research">
+      <section class="panel wide" data-panel="research">
         <div class="toolbar">
-          <h2 data-i18n="research.title">Strategy Market</h2>
+          <h2 data-i18n="research.title">Strategy Lab</h2>
           <div class="subtle" id="researchStatus" data-i18n="research.statusEmpty">No strategy scan has been run from the dashboard yet.</div>
         </div>
+        <div class="response-box" id="researchActionNotice" style="margin-bottom:16px;display:none"></div>
         <div class="research-layout">
           <article class="research-block">
             <h3 data-i18n="research.scan">Research Scan</h3>
-            <div class="ops-form">
+            <div class="ops-form research-scan-form">
               <label>
                 <span data-i18n="research.market">Market</span>
                 <select id="researchMarket">
@@ -2955,7 +3231,7 @@ DASHBOARD_TEMPLATE = """<!doctype html>
                   <option value="manual">manual weights</option>
                 </select>
               </label>
-              <label>
+              <label class="wide-input">
                 <span data-i18n="research.manualWeights">Manual Weights</span>
                 <input id="researchManualWeights" value="" placeholder="sma_crossover=40, rsi_regime=35, ichimoku_trend=25" />
               </label>
@@ -2975,14 +3251,14 @@ DASHBOARD_TEMPLATE = """<!doctype html>
                 <span data-i18n="research.positionFraction">Position Fraction</span>
                 <input id="researchPositionFraction" value="1" />
               </label>
-              <div class="ops-row">
+              <div class="ops-row research-actions">
                 <button type="button" onclick="runResearchScan()" data-i18n="research.run">Run Strategy Scan</button>
               </div>
-              <div class="subtle" id="intervalHint">15m means each K-line covers 15 minutes. Increase Bars to simulate a longer period.</div>
+              <div class="subtle research-hint" id="intervalHint">15m means each K-line covers 15 minutes. Increase Bars to simulate a longer period.</div>
             </div>
           </article>
 
-          <div>
+          <div class="research-results-flow">
             <div class="research-block" id="researchSummaryPanel"></div>
             <div class="candidate-grid" id="researchAllocations"></div>
             <div class="candidate-grid" id="researchSecondary"></div>
@@ -3176,12 +3452,14 @@ DASHBOARD_TEMPLATE = """<!doctype html>
         "deployment.useSuggested": "Use Historical Defaults",
         "deployment.start": "Start Daemon",
         "deployment.stop": "Stop Stack",
+        "deployment.openLab": "Open Strategy Lab",
+        "deployment.openAutomation": "Open Automation Config",
         "deployment.hint": "Each budget is editable. The default suggestion is computed from recent historical replay for the profile when possible.",
         "liveCharts.title": "Live Strategy Charts",
         "liveCharts.subtitle": "The chart stays as a blank coordinate frame until a daemon is running. Once started, each profile begins monitoring and the curve starts plotting live points.",
         "statusLog.title": "Runtime Log",
         "statusLog.subtitle": "Condensed daemon, order, reconcile, and user-stream status.",
-        "research.title": "Strategy Market",
+        "research.title": "Strategy Lab",
         "research.statusEmpty": "No strategy scan has been run from the dashboard yet.",
         "research.scan": "Research Scan",
         "research.market": "Market",
@@ -3199,6 +3477,10 @@ DASHBOARD_TEMPLATE = """<!doctype html>
         "research.run": "Run Strategy Scan",
         "research.generateStack": "Generate Deployable Stack",
         "research.generatedStack": "Latest generated stack",
+        "research.fullSample": "Full Sample",
+        "research.recentWindow": "Recent Window",
+        "research.fullReturn": "Full Return",
+        "research.windowReturn": "Recent Return",
         "portfolio.title": "Portfolio",
         "advanced.title": "Advanced Operations",
         "advanced.subtitle": "Manual runtime controls and wallet actions are still available here, but the primary workflow lives in the Live Deployment panel.",
@@ -3285,12 +3567,14 @@ DASHBOARD_TEMPLATE = """<!doctype html>
         "deployment.useSuggested": "使用历史建议",
         "deployment.start": "启动 Daemon",
         "deployment.stop": "停止 Stack",
+        "deployment.openLab": "打开策略实验室",
+        "deployment.openAutomation": "打开自动化配置",
         "deployment.hint": "每个策略额度都可以手动调整；默认建议会尽量根据该 profile 的近期历史回放自动生成。",
         "liveCharts.title": "实时策略曲线",
         "liveCharts.subtitle": "启动前这里会显示空白坐标图。启动 daemon 后，每个策略开始监控，曲线会随着实时状态逐步打点。",
         "statusLog.title": "运行日志",
         "statusLog.subtitle": "简洁汇总 daemon、订单、对账和用户流状态。",
-        "research.title": "策略市场",
+        "research.title": "策略实验室",
         "research.statusEmpty": "还没有从 dashboard 发起过策略扫描。",
         "research.scan": "研究扫描",
         "research.market": "市场",
@@ -3308,6 +3592,10 @@ DASHBOARD_TEMPLATE = """<!doctype html>
         "research.run": "运行策略扫描",
         "research.generateStack": "生成可部署 Stack",
         "research.generatedStack": "最近生成的 Stack",
+        "research.fullSample": "完整样本",
+        "research.recentWindow": "近期窗口",
+        "research.fullReturn": "全样本收益",
+        "research.windowReturn": "近期收益",
         "portfolio.title": "资产总览",
         "advanced.title": "高级操作",
         "advanced.subtitle": "手动运行控制、钱包划转和临时下单仍然保留在这里，但日常主流程应该放在上面的实时部署面板。",
@@ -3687,25 +3975,29 @@ DASHBOARD_TEMPLATE = """<!doctype html>
             return `
             <article class="deployment-profile-row">
               <div class="deployment-profile-head">
-                <div>
+                <div class="deployment-profile-title">
                   <strong>${escapeHtml(profile.name)}</strong>
                   <div class="subtle">${escapeHtml(profile.symbol || "—")} · ${escapeHtml(profile.interval || "—")} · ${escapeHtml(profile.strategy_label || "strategy")}</div>
                 </div>
                 <span class="${pillClass(profile.status || "STOPPED", profile.status === "RUNNING")}">${escapeHtml(profile.status || "STOPPED")}</span>
               </div>
-              <label>
-                <span>${escapeHtml(t("live.planBudget"))}</span>
-                <input value="${escapeHtml(formatNumber(deploymentDraft.profileBudgets[profile.name] ?? profile.suggested_budget ?? 0))}" oninput="updateDeploymentBudget('${escapeHtml(profile.name)}', this.value)" />
-              </label>
-              <div class="deployment-profile-meta">
-                <div><span>${escapeHtml(t("live.historicalWeight"))}</span>${escapeHtml(formatPercent(profile.suggested_weight_pct))}</div>
-                <div><span>${escapeHtml(t("live.mode"))}</span>${escapeHtml(profile.submission_mode || "PLANNED")}</div>
+              <div class="deployment-profile-budget">
+                <label>
+                  <span>${escapeHtml(t("live.planBudget"))}</span>
+                  <input value="${escapeHtml(formatNumber(deploymentDraft.profileBudgets[profile.name] ?? profile.suggested_budget ?? 0))}" oninput="updateDeploymentBudget('${escapeHtml(profile.name)}', this.value)" />
+                </label>
+                <div class="deployment-profile-meta">
+                  <div><span>${escapeHtml(t("live.historicalWeight"))}</span>${escapeHtml(formatPercent(profile.suggested_weight_pct))}</div>
+                  <div><span>${escapeHtml(t("live.mode"))}</span>${escapeHtml(profile.submission_mode || "PLANNED")}</div>
+                </div>
               </div>
               <div class="deployment-param-grid">${paramRows}</div>
-              <div class="ops-row" style="margin-top:10px">
-                <button type="button" onclick="saveProfileParams('${escapeHtml(profile.name)}', '${escapeHtml(profile.path)}')">Save Params</button>
+              <div class="deployment-profile-actions">
+                <div class="ops-row">
+                  <button type="button" onclick="saveProfileParams('${escapeHtml(profile.name)}', '${escapeHtml(profile.path)}')">Save</button>
+                </div>
+                <div class="subtle deployment-profile-note" title="${escapeHtml(profile.history_basis || t("live.noActivity"))}">${escapeHtml(profile.history_basis || t("live.noActivity"))}</div>
               </div>
-              <div class="subtle" style="margin-top:8px">${escapeHtml(profile.history_basis || t("live.noActivity"))}</div>
             </article>
           `}).join("")}
         </div>
@@ -3716,73 +4008,83 @@ DASHBOARD_TEMPLATE = """<!doctype html>
       renderLiveOverview(deployment, stack);
     }
 
-    function renderStacks(stacks) {
-      const node = document.getElementById("stackList");
-      if (!stacks.length) {
+    function renderRuntime(stacks, services) {
+      const node = document.getElementById("runtimeList");
+      if (!node) return;
+      if (!stacks.length && !services.length) {
         node.innerHTML = `<div class="empty">${escapeHtml(t("live.noActivity"))}</div>`;
         return;
       }
-      node.innerHTML = stacks.map((item) => `
-        <article class="stack-card">
-          <div class="stack-head">
-            <div class="title-row">
-              <strong>${escapeHtml(item.stack_name)}</strong>
-              <span class="${pillClass(item.status, item.healthy)}">${escapeHtml(item.status)}</span>
+      const serviceByName = Object.fromEntries((services || []).map((item) => [item.service_name, item]));
+      const assigned = new Set();
+      const stackCards = (stacks || []).map((stack) => {
+        const members = (stack.members || []).map((member) => {
+          assigned.add(member.service_name);
+          return { ...member, ...(serviceByName[member.service_name] || {}) };
+        });
+        return `
+          <article class="runtime-stack-card">
+            <div class="runtime-stack-summary">
+              <div class="title-row">
+                <strong>${escapeHtml(stack.stack_name)}</strong>
+                <span class="${pillClass(stack.status, stack.healthy)}">${escapeHtml(stack.status)}</span>
+              </div>
+              <div><span class="subtle">Health</span><div>${escapeHtml(stack.healthy_profile_count)} / ${escapeHtml(stack.profile_count)}</div></div>
+              <div><span class="subtle">Heartbeat</span><div>${escapeHtml(stack.last_heartbeat_at)}</div></div>
+              <div><span class="subtle">${escapeHtml(t("live.lastUpdate"))}</span><div>${escapeHtml(stack.updated_at)}</div></div>
+              <div class="runtime-note" title="${escapeHtml(stack.reason || stack.error || "—")}"><span class="subtle">Reason</span><div>${escapeHtml(stack.reason || stack.error || "—")}</div></div>
             </div>
-            <div class="subtle">${escapeHtml(item.healthy_profile_count)} / ${escapeHtml(item.profile_count)} healthy</div>
-          </div>
-          <div class="meta-grid">
-            <div><span>Started</span>${escapeHtml(item.started_at)}</div>
-            <div><span>${escapeHtml(t("live.lastUpdate"))}</span>${escapeHtml(item.updated_at)}</div>
-            <div><span>Heartbeat</span>${escapeHtml(item.last_heartbeat_at)}</div>
-            <div><span>Reason</span>${escapeHtml(item.reason || item.error || "—")}</div>
-          </div>
-          ${item.members.length ? `<div class="list" style="margin-top:12px">${item.members.map((member) => `
-            <div class="runtime-file">
+            <div class="runtime-member-grid">
+              ${members.map((item) => `
+                <div class="runtime-member-card">
+                  <div class="service-head">
+                    <div class="title-row">
+                      <strong>${escapeHtml(item.service_name)}</strong>
+                      <span class="${pillClass(item.status || "UNKNOWN", item.healthy)}">${escapeHtml(item.status || "UNKNOWN")}</span>
+                      ${item.submission_mode ? `<span class="pill">${escapeHtml(item.submission_mode)}</span>` : ""}
+                    </div>
+                    <div class="subtle">restarts ${escapeHtml(item.restart_count ?? 0)}</div>
+                  </div>
+                  <div class="meta-grid">
+                    <div><span>Strategy</span>${escapeHtml(item.strategy_label || "—")}</div>
+                    <div><span>${escapeHtml(t("research.symbol"))}</span>${escapeHtml(item.symbol || "—")}</div>
+                    <div><span>${escapeHtml(t("live.interval"))}</span>${escapeHtml(item.interval || "—")}</div>
+                    <div><span>${escapeHtml(t("live.position"))}</span>${escapeHtml(item.ctx_state?.position_qty ?? "—")}</div>
+                    <div><span>Actions</span>${escapeHtml(item.actions ?? 0)}</div>
+                    <div><span>${escapeHtml(t("live.pendingOrder"))}</span>${escapeHtml(item.ctx_state?.pending_client_order_id ?? "—")}</div>
+                    <div><span>${escapeHtml(t("live.lastUpdate"))}</span>${escapeHtml(item.updated_at || "—")}</div>
+                    <div><span>Heartbeat</span>${escapeHtml(item.last_heartbeat_at || "—")}</div>
+                  </div>
+                  <div class="subtle runtime-note" style="margin-top:8px" title="${escapeHtml(item.reason || item.error || item.strategy_ref || "No runtime errors recorded.")}">${escapeHtml(item.reason || item.error || item.strategy_ref || "No runtime errors recorded.")}</div>
+                </div>
+              `).join("") || `<div class="empty">No member services reported yet.</div>`}
+            </div>
+          </article>
+        `;
+      });
+      const orphanCards = (services || []).filter((item) => !assigned.has(item.service_name)).map((item) => `
+        <article class="runtime-stack-card">
+          <div class="runtime-member-grid">
+            <div class="runtime-member-card">
               <div class="service-head">
                 <div class="title-row">
-                  <strong>${escapeHtml(member.service_name)}</strong>
-                  <span class="${pillClass(member.status, member.healthy)}">${escapeHtml(member.status || "UNKNOWN")}</span>
+                  <strong>${escapeHtml(item.service_name)}</strong>
+                  <span class="${pillClass(item.status, item.healthy)}">${escapeHtml(item.status)}</span>
+                  <span class="pill">${escapeHtml(item.submission_mode)}</span>
                 </div>
-                <div class="subtle">restarts ${escapeHtml(member.restart_count ?? 0)}</div>
+                <div class="subtle">standalone · restarts ${escapeHtml(item.restart_count)}</div>
               </div>
-              <div class="subtle">${escapeHtml(member.reason || member.error || member.updated_at || "—")}</div>
+              <div class="meta-grid">
+                <div><span>Strategy</span>${escapeHtml(item.strategy_label)}</div>
+                <div><span>${escapeHtml(t("research.symbol"))}</span>${escapeHtml(item.symbol || "—")}</div>
+                <div><span>${escapeHtml(t("live.interval"))}</span>${escapeHtml(item.interval || "—")}</div>
+                <div><span>${escapeHtml(t("live.position"))}</span>${escapeHtml(item.ctx_state?.position_qty ?? "—")}</div>
+              </div>
             </div>
-          `).join("")}</div>` : ""}
-        </article>
-      `).join("");
-    }
-
-    function renderServices(services) {
-      const node = document.getElementById("serviceList");
-      if (!services.length) {
-        node.innerHTML = `<div class="empty">${escapeHtml(t("live.noActivity"))}</div>`;
-        return;
-      }
-      node.innerHTML = services.map((item) => `
-        <article class="service-card">
-          <div class="service-head">
-            <div class="title-row">
-              <strong>${escapeHtml(item.service_name)}</strong>
-              <span class="${pillClass(item.status, item.healthy)}">${escapeHtml(item.status)}</span>
-              <span class="pill">${escapeHtml(item.submission_mode)}</span>
-            </div>
-            <div class="subtle">restarts ${escapeHtml(item.restart_count)}</div>
           </div>
-          <div class="meta-grid">
-            <div><span>Strategy</span>${escapeHtml(item.strategy_label)}</div>
-            <div><span>${escapeHtml(t("research.market"))}</span>${escapeHtml(item.market_type)}</div>
-            <div><span>${escapeHtml(t("research.symbol"))}</span>${escapeHtml(item.symbol || "—")}</div>
-            <div><span>${escapeHtml(t("live.interval"))}</span>${escapeHtml(item.interval || "—")}</div>
-            <div><span>Heartbeat</span>${escapeHtml(item.last_heartbeat_at)}</div>
-            <div><span>${escapeHtml(t("live.lastUpdate"))}</span>${escapeHtml(item.updated_at)}</div>
-            <div><span>Actions</span>${escapeHtml(item.actions ?? 0)}</div>
-            <div><span>${escapeHtml(t("live.position"))}</span>${escapeHtml(item.ctx_state?.position_qty ?? "—")}</div>
-            <div><span>${escapeHtml(t("live.pendingOrder"))}</span>${escapeHtml(item.ctx_state?.pending_client_order_id ?? "—")}</div>
-          </div>
-          <div class="subtle" style="margin-top:10px">${escapeHtml(item.reason || item.error || item.strategy_ref || "No runtime errors recorded.")}</div>
         </article>
-      `).join("");
+      `);
+      node.innerHTML = [...stackCards, ...orphanCards].join("");
     }
 
     function renderLiveStrategyCard(profile, item) {
@@ -3792,7 +4094,8 @@ DASHBOARD_TEMPLATE = """<!doctype html>
       const padY = 18;
       const plannedBudget = deploymentDraft.profileBudgets?.[profile.name] ?? profile.suggested_budget ?? profile.current_budget ?? 0;
       const activity = profile.activity || [t("live.noActivity")];
-      if (!item) {
+      const chartActive = item && item.status === "RUNNING" && item.healthy;
+      if (!chartActive) {
         return `
           <article class="chart-card placeholder">
             <div class="service-head">
@@ -3848,15 +4151,15 @@ DASHBOARD_TEMPLATE = """<!doctype html>
               <line x1="${padX}" y1="${topY}" x2="${width - padX}" y2="${topY}" stroke="rgba(23,22,26,0.08)" stroke-width="1" />
               <line x1="${padX}" y1="${midY}" x2="${width - padX}" y2="${midY}" stroke="rgba(23,22,26,0.10)" stroke-width="1" stroke-dasharray="4 6" />
               <line x1="${padX}" y1="${bottomY}" x2="${width - padX}" y2="${bottomY}" stroke="rgba(23,22,26,0.08)" stroke-width="1" />
-              ${slowPoints ? `<polyline fill="none" stroke="#d39b2a" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" points="${slowPoints}" />` : ""}
-              ${fastPoints ? `<polyline fill="none" stroke="#187d78" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" points="${fastPoints}" />` : ""}
-              <polyline fill="none" stroke="#17161a" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" points="${closePoints}" />
+              ${slowPoints ? `<polyline fill="none" stroke="#ffd166" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" points="${slowPoints}" />` : ""}
+              ${fastPoints ? `<polyline fill="none" stroke="#54f0c8" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" points="${fastPoints}" />` : ""}
+              <polyline fill="none" stroke="#f2f8ff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" points="${closePoints}" />
             </svg>
           </div>
           <div class="chart-legend">
-            <span class="legend-key" style="color:#17161a"><span class="legend-line"></span>Close ${escapeHtml(formatNumber(item.last_close))}</span>
-            ${item.fast_period ? `<span class="legend-key" style="color:#187d78"><span class="legend-line"></span>EMA ${escapeHtml(item.fast_period)} ${escapeHtml(formatNumber(lastValue(item.series?.fast_ema)))}</span>` : ""}
-            ${item.slow_period ? `<span class="legend-key" style="color:#d39b2a"><span class="legend-line"></span>EMA ${escapeHtml(item.slow_period)} ${escapeHtml(formatNumber(lastValue(item.series?.slow_ema)))}</span>` : ""}
+            <span class="legend-key" style="color:#f2f8ff"><span class="legend-line"></span>Close ${escapeHtml(formatNumber(item.last_close))}</span>
+            ${item.fast_period ? `<span class="legend-key" style="color:#54f0c8"><span class="legend-line"></span>EMA ${escapeHtml(item.fast_period)} ${escapeHtml(formatNumber(lastValue(item.series?.fast_ema)))}</span>` : ""}
+            ${item.slow_period ? `<span class="legend-key" style="color:#ffd166"><span class="legend-line"></span>EMA ${escapeHtml(item.slow_period)} ${escapeHtml(formatNumber(lastValue(item.series?.slow_ema)))}</span>` : ""}
           </div>
           <div class="chart-meta">
             <div><span>${escapeHtml(t("live.planBudget"))}</span>${escapeHtml(formatMoney(plannedBudget))}</div>
@@ -3879,7 +4182,7 @@ DASHBOARD_TEMPLATE = """<!doctype html>
     }
 
     function markerColor(kind) {
-      return kind === "buy" ? "#13795b" : "#b43a3a";
+      return kind === "buy" ? "#48f5a8" : "#ff5c7a";
     }
 
     function markerGlyph(kind) {
@@ -3932,19 +4235,19 @@ DASHBOARD_TEMPLATE = """<!doctype html>
         <div class="candidate-chart-wrap">
           ${priceSeries.length >= 2 ? `
             <svg class="candidate-chart-svg" viewBox="0 0 ${width} ${height}" role="img" aria-label="${escapeHtml(item.title)} price chart">
-              <polyline fill="none" stroke="#17161a" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" points="${pricePoints}" />
+              <polyline fill="none" stroke="#f2f8ff" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round" points="${pricePoints}" />
               ${markerSvg}
             </svg>
           ` : `<div class="empty" style="padding:16px">No price history available.</div>`}
         </div>
         <div class="candidate-legend">
-          <span class="legend-key" style="color:#17161a"><span class="legend-line"></span>Close ${escapeHtml(formatNumber(lastValue(priceSeries)))}</span>
+          <span class="legend-key" style="color:#f2f8ff"><span class="legend-line"></span>Close ${escapeHtml(formatNumber(lastValue(priceSeries)))}</span>
           ${markerLegend}
         </div>
         <div class="candidate-chart-wrap" style="margin-top:10px">
           ${equityValues.length >= 2 ? `
             <svg class="candidate-chart-svg" viewBox="0 0 ${width} ${miniHeight}" role="img" aria-label="${escapeHtml(item.title)} equity curve">
-              <polyline fill="none" stroke="#187d78" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" points="${equityPoints}" />
+              <polyline fill="none" stroke="#54f0c8" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" points="${equityPoints}" />
             </svg>
           ` : `<div class="empty" style="padding:16px">No equity curve available.</div>`}
         </div>
@@ -3954,8 +4257,8 @@ DASHBOARD_TEMPLATE = """<!doctype html>
     function renderResearchCandidateCard(item, tagLabel, tagTone, headerNote = "") {
       const chartTabs = `
         <div class="title-row" style="margin-top:10px;margin-bottom:4px">
-          <span class="pill active" data-chart-mode="recent">Recent Window</span>
-          <span class="pill" data-chart-mode="full">Full Sample</span>
+          <span class="pill active" data-chart-mode="full">${escapeHtml(t("research.fullSample"))}</span>
+          <span class="pill" data-chart-mode="recent">${escapeHtml(t("research.recentWindow"))}</span>
         </div>
       `;
       return `
@@ -3972,15 +4275,15 @@ DASHBOARD_TEMPLATE = """<!doctype html>
           ${headerNote ? `<div class="subtle">${escapeHtml(headerNote)}</div>` : ""}
           <div class="subtle">${escapeHtml(item.description || "")}</div>
           ${chartTabs}
-          <div class="candidate-chart-panel" data-chart-panel="recent">${renderResearchCandidateChartPanel(item, "recent")}</div>
-          <div class="candidate-chart-panel" data-chart-panel="full" style="display:none">${renderResearchCandidateChartPanel(item, "full")}</div>
+          <div class="candidate-chart-panel" data-chart-panel="full">${renderResearchCandidateChartPanel(item, "full")}</div>
+          <div class="candidate-chart-panel" data-chart-panel="recent" style="display:none">${renderResearchCandidateChartPanel(item, "recent")}</div>
           <div class="candidate-metrics" style="margin-top:12px">
-            <div class="mini-metric"><span>Window Return</span><strong>${escapeHtml(formatPercent(item.metrics.window_return_pct))}</strong></div>
-            <div class="mini-metric"><span>Full Return</span><strong>${escapeHtml(formatPercent(item.metrics.total_return_pct))}</strong></div>
+            <div class="mini-metric"><span>${escapeHtml(t("research.fullReturn"))}</span><strong>${escapeHtml(formatPercent(item.metrics.total_return_pct))}</strong></div>
             <div class="mini-metric"><span>Full Drawdown</span><strong>${escapeHtml(formatPercent(item.metrics.max_drawdown_pct))}</strong></div>
             <div class="mini-metric"><span>Profit Factor</span><strong>${escapeHtml(formatNumber(item.metrics.profit_factor))}</strong></div>
             <div class="mini-metric"><span>Sharpe</span><strong>${escapeHtml(formatNumber(item.metrics.sharpe))}</strong></div>
             <div class="mini-metric"><span>Win Rate</span><strong>${escapeHtml(formatPercent(item.metrics.win_rate_pct))}</strong></div>
+            <div class="mini-metric"><span>${escapeHtml(t("research.windowReturn"))}</span><strong>${escapeHtml(formatPercent(item.metrics.window_return_pct))}</strong></div>
             <div class="mini-metric"><span>Trades</span><strong>${escapeHtml(formatNumber(item.metrics.trade_count))}</strong></div>
           </div>
           <div class="candidate-notes">
@@ -4008,7 +4311,7 @@ DASHBOARD_TEMPLATE = """<!doctype html>
       return `
         <div class="candidate-chart-wrap" style="margin-top:14px">
           <svg class="candidate-chart-svg" viewBox="0 0 ${width} ${height}" role="img" aria-label="portfolio simulation">
-            <polyline fill="none" stroke="#187d78" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" points="${points}" />
+            <polyline fill="none" stroke="#54f0c8" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" points="${points}" />
           </svg>
         </div>
         <div class="candidate-metrics" style="margin-top:12px">
@@ -4277,20 +4580,27 @@ DASHBOARD_TEMPLATE = """<!doctype html>
 
     function renderActionFeedback(payload, response) {
       const node = document.getElementById("actionResponse");
+      const researchNotice = document.getElementById("researchActionNotice");
       if (!response?.ok) {
-        node.innerHTML = `
+        const errorHtml = `
           <h3>${escapeHtml(t("advanced.actionCenter"))}</h3>
           <div class="subtle">${escapeHtml(currentLocale === "zh" ? "最近一次操作失败。" : "The last action failed.")}</div>
           <ul class="research-list" style="margin-top:12px">
             <li>${escapeHtml(response?.error || "Unknown error")}</li>
           </ul>
         `;
+        node.innerHTML = errorHtml;
+        if (researchNotice && ["research_scan", "generate_research_stack"].includes(payload.action)) {
+          researchNotice.style.display = "";
+          researchNotice.innerHTML = errorHtml;
+        }
         return;
       }
       const result = response.result || {};
       const action = payload.action;
       let title = currentLocale === "zh" ? "操作完成" : "Action Complete";
       let points = [];
+      let footer = "";
       if (action === "start_stack" || action === "start_profile") {
         title = result.status === "ALREADY_RUNNING" ? "Already Running" : "Daemon Started";
         points = [
@@ -4353,7 +4663,9 @@ DASHBOARD_TEMPLATE = """<!doctype html>
           `${result.stack?.name || "stack"} ready for deployment`,
           `${result.stack?.profile_count || 0} profiles written`,
           `path ${result.stack?.path || "—"}`,
+          `Automation Config has been refreshed; open it to review budgets and start the daemon.`,
         ];
+        footer = `<div class="ops-row" style="margin-top:12px"><button type="button" onclick="switchPanel('automation')">${escapeHtml(t("deployment.openAutomation"))}</button></div>`;
       } else if (action === "update_profile_params") {
         title = "Strategy Params Saved";
         points = [
@@ -4364,12 +4676,18 @@ DASHBOARD_TEMPLATE = """<!doctype html>
       } else {
         points = [result.status || "OK"];
       }
-      node.innerHTML = `
+      const html = `
         <h3>${escapeHtml(title)}</h3>
         <ul class="research-list">
           ${points.map((point) => `<li>${escapeHtml(point)}</li>`).join("")}
         </ul>
+        ${footer}
       `;
+      node.innerHTML = html;
+      if (researchNotice && ["research_scan", "generate_research_stack"].includes(payload.action)) {
+        researchNotice.style.display = "";
+        researchNotice.innerHTML = html;
+      }
     }
 
     async function postAction(payload) {
@@ -4382,14 +4700,13 @@ DASHBOARD_TEMPLATE = """<!doctype html>
           body: JSON.stringify(payload),
         });
         const data = await response.json();
-      if (data?.ok && payload.action === "generate_research_stack" && data.result?.stack?.path) {
-        deploymentDraft.stackPath = data.result.stack.path;
-        deploymentDraft.profileBudgets = {};
-        currentPanel = "automation";
-        window.localStorage.setItem("dashboardPanel", currentPanel);
-      }
+        if (data?.ok && payload.action === "generate_research_stack" && data.result?.stack?.path) {
+          deploymentDraft.stackPath = data.result.stack.path;
+          deploymentDraft.profileBudgets = {};
+          deploymentDraft.profileParams = {};
+        }
         renderActionFeedback(payload, data);
-        await refresh();
+        await refresh(true);
       } catch (error) {
         renderActionFeedback(payload, { ok: false, error: String(error) });
       }
@@ -4542,8 +4859,7 @@ DASHBOARD_TEMPLATE = """<!doctype html>
       }
       updateSection("readiness", data, renderReadiness);
       updateSection("summary", data.summary, renderSummary);
-      updateSection("stacks", data.stacks, renderStacks);
-      updateSection("services", data.services, renderServices);
+      updateSection("runtime", { stacks: data.stacks || [], services: data.services || [] }, (payload) => renderRuntime(payload.stacks, payload.services));
       updateSection("research", data.research || {}, renderResearch);
       updateSection("portfolio", data.portfolio, renderPortfolio);
       updateSection("orders", data.orders, renderOrders);
@@ -4565,11 +4881,11 @@ DASHBOARD_TEMPLATE = """<!doctype html>
       switchPanel(currentPanel);
     }
 
-    async function refresh() {
+    async function refresh(force = false) {
       try {
         const response = await fetch("/api/snapshot", { cache: "no-store" });
         const data = await response.json();
-        renderCurrentSnapshot(data);
+        renderCurrentSnapshot(data, { force });
       } catch (error) {
         document.getElementById("generatedAt").textContent = `Dashboard fetch failed: ${error}`;
       }

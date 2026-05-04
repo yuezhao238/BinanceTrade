@@ -154,6 +154,159 @@ def test_render_dashboard_html_embeds_refresh_interval() -> None:
     assert "/api/snapshot" in html
 
 
+def test_stopped_daemon_does_not_emit_live_strategy_chart(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    store = SQLiteStateStore(settings.state_db_path)
+
+    run_id = store.start_runtime_session(
+        service_name="stopped-spot-btc",
+        market_type=MarketType.SPOT,
+        strategy_ref="examples/strategies/spot_ema_persistent.py:create_strategy",
+        submission_mode=SubmissionMode.DRY_RUN,
+        profile={"name": "stopped-spot-btc"},
+        restart_count=0,
+        stale_after_seconds=90,
+    )
+    store.update_runtime_status(
+        service_name="stopped-spot-btc",
+        run_id=run_id,
+        market_type=MarketType.SPOT,
+        strategy_ref="examples/strategies/spot_ema_persistent.py:create_strategy",
+        submission_mode=SubmissionMode.DRY_RUN,
+        status="STOPPED",
+        restart_count=0,
+        stale_after_seconds=90,
+        summary={"reason": "shutdown requested"},
+        ctx_state={"position_qty": "0"},
+        strategy_state={
+            "symbol": "BTCUSDT",
+            "interval": "1h",
+            "fast_period": 20,
+            "slow_period": 50,
+            "candles": [
+                {"close_time": 1, "high": "1.2", "low": "0.9", "close": "1.0"},
+                {"close_time": 2, "high": "1.3", "low": "1.0", "close": "1.1"},
+                {"close_time": 3, "high": "1.4", "low": "1.1", "close": "1.2"},
+            ],
+        },
+    )
+
+    service = DashboardDataService(
+        settings=settings,
+        config=DashboardConfig(include_portfolio=False),
+        state_store=store,
+    )
+
+    snapshot = service.build_snapshot()
+
+    assert snapshot["services"] == []
+    assert snapshot["summary"]["stopped_service_count"] == 1
+    assert snapshot["strategy_charts"] == []
+
+
+def test_stopped_runtime_records_are_hidden_from_status_lists(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    store = SQLiteStateStore(settings.state_db_path)
+
+    run_id = store.start_runtime_session(
+        service_name="old-lab-spot-btc",
+        market_type=MarketType.SPOT,
+        strategy_ref="examples/strategies/spot_ema_persistent.py:create_strategy",
+        submission_mode=SubmissionMode.DRY_RUN,
+        profile={"name": "old-lab-spot-btc"},
+        restart_count=12,
+        stale_after_seconds=90,
+    )
+    store.update_runtime_status(
+        service_name="old-lab-spot-btc",
+        run_id=run_id,
+        market_type=MarketType.SPOT,
+        strategy_ref="examples/strategies/spot_ema_persistent.py:create_strategy",
+        submission_mode=SubmissionMode.DRY_RUN,
+        status="STOPPED",
+        restart_count=12,
+        stale_after_seconds=90,
+        summary={"reason": "STOPPED"},
+    )
+    stack_run_id = store.start_runtime_stack_session(
+        stack_name="old-lab-stack",
+        profile_count=1,
+        stale_after_seconds=90,
+        config={"name": "old-lab-stack"},
+    )
+    store.update_runtime_stack_status(
+        stack_name="old-lab-stack",
+        run_id=stack_run_id,
+        status="STOPPED",
+        profile_count=1,
+        healthy_profile_count=0,
+        stale_after_seconds=90,
+        summary={"reason": "STOPPED"},
+    )
+    settings.runtime_dir.mkdir(parents=True, exist_ok=True)
+    (settings.runtime_dir / "old-lab-spot-btc.json").write_text(
+        json.dumps({"status": "STOPPED", "updated_at": "2026-05-04T00:00:00+00:00"}),
+        encoding="utf-8",
+    )
+
+    service = DashboardDataService(
+        settings=settings,
+        config=DashboardConfig(include_portfolio=False),
+        state_store=store,
+    )
+
+    snapshot = service.build_snapshot()
+
+    assert snapshot["stacks"] == []
+    assert snapshot["services"] == []
+    assert snapshot["runtime_files"] == []
+    assert snapshot["status_log"] == []
+    assert snapshot["summary"]["stopped_stack_count"] == 1
+    assert snapshot["summary"]["stopped_service_count"] == 1
+
+
+def test_stale_restarting_runtime_is_hidden_from_status_lists(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    store = SQLiteStateStore(settings.state_db_path)
+
+    run_id = store.start_runtime_session(
+        service_name="stale-restart-loop",
+        market_type=MarketType.SPOT,
+        strategy_ref="examples/strategies/spot_ema_persistent.py:create_strategy",
+        submission_mode=SubmissionMode.DRY_RUN,
+        profile={"name": "stale-restart-loop"},
+        restart_count=1214,
+        stale_after_seconds=1,
+    )
+    store.update_runtime_status(
+        service_name="stale-restart-loop",
+        run_id=run_id,
+        market_type=MarketType.SPOT,
+        strategy_ref="examples/strategies/spot_ema_persistent.py:create_strategy",
+        submission_mode=SubmissionMode.DRY_RUN,
+        status="RESTARTING",
+        restart_count=1214,
+        stale_after_seconds=1,
+        summary={"error": "http=451 restricted location"},
+    )
+    with store._connect() as connection:
+        connection.execute(
+            "UPDATE runtime_status SET last_heartbeat_at = ?, updated_at = ? WHERE service_name = ?",
+            ("2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00", "stale-restart-loop"),
+        )
+
+    service = DashboardDataService(
+        settings=settings,
+        config=DashboardConfig(include_portfolio=False),
+        state_store=store,
+    )
+
+    snapshot = service.build_snapshot()
+
+    assert snapshot["services"] == []
+    assert snapshot["status_log"] == []
+
+
 def test_dashboard_control_plane_discovers_runtime_files_and_starts_profile(monkeypatch, tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     workspace_root = tmp_path / "workspace"
@@ -382,6 +535,8 @@ def test_candidate_row_exposes_window_and_full_sample_metrics(tmp_path: Path) ->
     assert set(row["chart"].keys()) == {"recent", "full"}
     assert row["chart"]["recent"]["price"]["close"] == [88000.0, 96000.0, 77602.0]
     assert row["chart"]["full"]["price"]["close"] == [88000.0, 96000.0, 77602.0]
-    assert "recent 3 bars" in row["ops_summary"]["window_scope"]
+    assert "last 3 bars" in row["ops_summary"]["window_scope"]
+    assert "secondary zoom" in row["ops_summary"]["window_scope"]
     assert "complete simulated path across 3 bars" in row["ops_summary"]["full_scope"]
+    assert "B/S markers" in row["ops_summary"]["full_scope"]
     assert "full simulated sample" in row["ops_summary"]["metric_scope"]
