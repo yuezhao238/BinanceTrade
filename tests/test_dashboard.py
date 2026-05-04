@@ -142,11 +142,12 @@ def test_dashboard_snapshot_aggregates_runtime_state(tmp_path: Path) -> None:
 def test_render_dashboard_html_embeds_refresh_interval() -> None:
     html = render_dashboard_html(refresh_seconds=12)
 
-    assert "Local Ops Dashboard" in html
+    assert "Ops Terminal" in html
     assert "Live Strategy Charts" in html
-    assert "Live Deployment" in html
+    assert "Automation Config" in html
     assert "Strategy Lab" in html
-    assert "Live Console" in html
+    assert "Configure Automated Trading" in html
+    assert "Current Status" in html
     assert "Generate Deployable Stack" in html
     assert "Earn to Spot" in html
     assert "const REFRESH_SECONDS = 12;" in html

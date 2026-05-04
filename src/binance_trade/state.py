@@ -276,6 +276,37 @@ class SQLiteStateStore:
             ).fetchone()
         return int(row["count"]) if row else 0
 
+    def list_local_open_orders(self, symbol: str | None, market_type: MarketType) -> list[dict[str, Any]]:
+        clauses = ["market_type = ?", "status IN ('LOCAL_PENDING', 'NEW', 'PARTIALLY_FILLED', 'PENDING_UNKNOWN')"]
+        params: list[Any] = [market_type.value]
+        if symbol:
+            clauses.append("symbol = ?")
+            params.append(symbol.upper())
+        query = f"""
+            SELECT *
+            FROM orders
+            WHERE {' AND '.join(clauses)}
+            ORDER BY created_at ASC
+        """
+        with self._connect() as connection:
+            rows = connection.execute(query, params).fetchall()
+        return [dict(row) for row in rows]
+
+    def mark_order_reconciled_missing(
+        self,
+        client_order_id: str,
+        *,
+        reason: str,
+        market_type: MarketType,
+    ) -> None:
+        payload = {
+            "status": "RECONCILED_MISSING",
+            "clientOrderId": client_order_id,
+            "reason": reason,
+            "marketType": market_type.value,
+        }
+        self.record_order_result(client_order_id, payload, fallback_status="RECONCILED_MISSING")
+
     def last_order_update(self, symbol: str, market_type: MarketType) -> str | None:
         with self._connect() as connection:
             row = connection.execute(

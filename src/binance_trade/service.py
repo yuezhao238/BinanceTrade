@@ -7,7 +7,7 @@ from itertools import chain
 from typing import Any
 
 from .config import Settings
-from .exceptions import BinanceExecutionUnknown, BinanceTradeError, ConfigError, RiskRejected
+from .exceptions import BinanceAPIError, BinanceExecutionUnknown, BinanceTradeError, ConfigError, RiskRejected
 from .filters import SymbolRules
 from .futures_rest import BinanceFuturesRestClient
 from .futures_ws_user import FuturesUserDataStreamClient
@@ -464,6 +464,20 @@ class SpotTradingService:
             }
             self.state.record_order_result(prepared.new_client_order_id or "", unknown, fallback_status="PENDING_UNKNOWN")
             raise
+        except BinanceTradeError as exc:
+            failed = {
+                "status": "SUBMIT_FAILED",
+                "clientOrderId": prepared.new_client_order_id,
+                "symbol": prepared.symbol,
+                "error": str(exc),
+                "errorType": exc.__class__.__name__,
+            }
+            if isinstance(exc, BinanceAPIError):
+                failed["httpStatus"] = exc.http_status
+                failed["code"] = exc.code
+                failed["payload"] = exc.payload
+            self.state.record_order_result(prepared.new_client_order_id or "", failed, fallback_status="SUBMIT_FAILED")
+            raise
 
         self.state.record_order_result(prepared.new_client_order_id or "", response, fallback_status="LIVE_ACCEPTED")
         return response
@@ -532,9 +546,42 @@ class SpotTradingService:
 
     async def reconcile(self, symbol: str | None = None) -> dict[str, Any]:
         open_orders = await self.rest.get_open_orders(symbol)
+        exchange_client_ids = {str(order.get("clientOrderId")) for order in open_orders if order.get("clientOrderId")}
         for order in open_orders:
             self.state.apply_exchange_order_snapshot(order, market_type=MarketType.SPOT)
-        return {"open_orders": open_orders}
+
+        checked_local_orders: list[dict[str, Any]] = []
+        for order in self.state.list_local_open_orders(symbol, MarketType.SPOT):
+            client_order_id = str(order.get("client_order_id") or "")
+            order_symbol = str(order.get("symbol") or "").upper()
+            if not client_order_id or client_order_id in exchange_client_ids:
+                continue
+            try:
+                snapshot = await self.rest.get_order(order_symbol, client_order_id=client_order_id)
+            except BinanceAPIError as exc:
+                if exc.code == -2013:
+                    reason = "exchange reports unknown order during reconcile"
+                    self.state.mark_order_reconciled_missing(client_order_id, reason=reason, market_type=MarketType.SPOT)
+                    checked_local_orders.append(
+                        {
+                            "client_order_id": client_order_id,
+                            "symbol": order_symbol,
+                            "status": "RECONCILED_MISSING",
+                            "reason": reason,
+                        }
+                    )
+                    continue
+                raise
+            self.state.apply_exchange_order_snapshot(snapshot, market_type=MarketType.SPOT)
+            checked_local_orders.append(
+                {
+                    "client_order_id": client_order_id,
+                    "symbol": order_symbol,
+                    "status": snapshot.get("status", "UNKNOWN"),
+                    "exchange_order_id": snapshot.get("orderId"),
+                }
+            )
+        return {"open_orders": open_orders, "checked_local_orders": checked_local_orders}
 
     async def raw_market_messages(self, streams: list[str], *, reconnect: bool = True):
         async for message in self.market.listen(streams, reconnect=reconnect):
@@ -763,6 +810,20 @@ class FuturesTradingService:
                 "payload": exc.payload,
             }
             self.state.record_order_result(prepared.new_client_order_id or "", unknown, fallback_status="PENDING_UNKNOWN")
+            raise
+        except BinanceTradeError as exc:
+            failed = {
+                "status": "SUBMIT_FAILED",
+                "clientOrderId": prepared.new_client_order_id,
+                "symbol": prepared.symbol,
+                "error": str(exc),
+                "errorType": exc.__class__.__name__,
+            }
+            if isinstance(exc, BinanceAPIError):
+                failed["httpStatus"] = exc.http_status
+                failed["code"] = exc.code
+                failed["payload"] = exc.payload
+            self.state.record_order_result(prepared.new_client_order_id or "", failed, fallback_status="SUBMIT_FAILED")
             raise
 
         self.state.record_order_result(prepared.new_client_order_id or "", response, fallback_status="LIVE_ACCEPTED")

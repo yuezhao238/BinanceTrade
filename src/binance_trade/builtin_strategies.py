@@ -358,6 +358,45 @@ def williams_r(candles: list[Candle], period: int = 14) -> float | None:
     return -100 * ((highest - window[-1].close) / denominator)
 
 
+def roc(values: list[float], period: int = 12) -> float | None:
+    if len(values) <= period:
+        return None
+    base = values[-period - 1]
+    if base == 0:
+        return 0.0
+    return ((values[-1] / base) - 1) * 100
+
+
+def rolling_vwap(candles: list[Candle], period: int = 48) -> float | None:
+    if len(candles) < period:
+        return None
+    window = candles[-period:]
+    volume_sum = sum(item.volume for item in window)
+    if volume_sum == 0:
+        return None
+    return sum(((item.high + item.low + item.close) / 3) * item.volume for item in window) / volume_sum
+
+
+def donchian(candles: list[Candle], period: int = 20) -> tuple[float, float, float] | None:
+    if len(candles) < period:
+        return None
+    window = candles[-period:]
+    upper = max(item.high for item in window)
+    lower = min(item.low for item in window)
+    return upper, (upper + lower) / 2, lower
+
+
+def heikin_ashi(candles: list[Candle]) -> list[tuple[float, float, float, float]]:
+    result: list[tuple[float, float, float, float]] = []
+    for candle in candles:
+        ha_close = (candle.open + candle.high + candle.low + candle.close) / 4
+        ha_open = (candle.open + candle.close) / 2 if not result else (result[-1][0] + result[-1][3]) / 2
+        ha_high = max(candle.high, ha_open, ha_close)
+        ha_low = min(candle.low, ha_open, ha_close)
+        result.append((ha_open, ha_high, ha_low, ha_close))
+    return result
+
+
 @dataclass(slots=True)
 class BuiltinStrategySpec:
     name: str
@@ -936,6 +975,226 @@ class WilliamsRStrategy(BaseKlineSignalStrategy):
         return None
 
 
+@dataclass(slots=True)
+class DonchianBreakoutStrategy(BaseKlineSignalStrategy):
+    period: int = 20
+
+    def required_bars(self) -> int:
+        return self.period + 5
+
+    def compute_signal(self, candles: list[Candle]) -> tuple[int, str] | None:
+        previous_channel = donchian(candles[:-1], self.period)
+        if previous_channel is None:
+            return None
+        upper, _, lower = previous_channel
+        close = candles[-1].close
+        if close > upper:
+            return 1, f"donchian {self.period} upside breakout"
+        if close < lower:
+            return -1, f"donchian {self.period} downside breakout"
+        return None
+
+
+@dataclass(slots=True)
+class DonchianMeanReversionStrategy(BaseKlineSignalStrategy):
+    period: int = 20
+
+    def required_bars(self) -> int:
+        return self.period + 6
+
+    def compute_signal(self, candles: list[Candle]) -> tuple[int, str] | None:
+        current = donchian(candles, self.period)
+        previous = donchian(candles[:-1], self.period)
+        if current is None or previous is None:
+            return None
+        upper_now, mid_now, lower_now = current
+        upper_prev, _, lower_prev = previous
+        close = candles[-1].close
+        prev_close = candles[-2].close
+        if prev_close <= lower_prev and close > lower_now and close < mid_now:
+            return 1, "donchian lower-band recovery"
+        if prev_close >= upper_prev and close < upper_now and close > mid_now:
+            return -1, "donchian upper-band rejection"
+        return None
+
+
+@dataclass(slots=True)
+class RocMomentumStrategy(BaseKlineSignalStrategy):
+    period: int = 12
+    threshold: float = 0.0
+
+    def required_bars(self) -> int:
+        return self.period + 10
+
+    def compute_signal(self, candles: list[Candle]) -> tuple[int, str] | None:
+        series = closes(candles)
+        current = roc(series, self.period)
+        previous = roc(series[:-1], self.period)
+        if current is None or previous is None:
+            return None
+        if previous <= self.threshold and current > self.threshold:
+            return 1, "rate-of-change crossed into positive momentum"
+        if previous >= -self.threshold and current < -self.threshold:
+            return -1, "rate-of-change crossed into negative momentum"
+        return None
+
+
+@dataclass(slots=True)
+class EmaPullbackStrategy(BaseKlineSignalStrategy):
+    pullback_period: int = 10
+    trend_period: int = 50
+
+    def required_bars(self) -> int:
+        return self.trend_period + 10
+
+    def compute_signal(self, candles: list[Candle]) -> tuple[int, str] | None:
+        series = closes(candles)
+        pullback_now = ema(series, self.pullback_period)
+        trend_now = ema(series, self.trend_period)
+        pullback_prev = ema(series[:-1], self.pullback_period)
+        trend_prev = ema(series[:-1], self.trend_period)
+        if None in {pullback_now, trend_now, pullback_prev, trend_prev}:
+            return None
+        close = series[-1]
+        prev_close = series[-2]
+        if close > trend_now and prev_close <= pullback_prev and close > pullback_now:
+            return 1, "ema trend pullback recovered upward"
+        if close < trend_now and prev_close >= pullback_prev and close < pullback_now:
+            return -1, "ema trend pullback failed downward"
+        return None
+
+
+@dataclass(slots=True)
+class TripleMaTrendStrategy(BaseKlineSignalStrategy):
+    fast_period: int = 10
+    mid_period: int = 20
+    slow_period: int = 50
+
+    def required_bars(self) -> int:
+        return self.slow_period + 10
+
+    def compute_signal(self, candles: list[Candle]) -> tuple[int, str] | None:
+        series = closes(candles)
+        fast = ema(series, self.fast_period)
+        mid = ema(series, self.mid_period)
+        slow = ema(series, self.slow_period)
+        prev_fast = ema(series[:-1], self.fast_period)
+        prev_mid = ema(series[:-1], self.mid_period)
+        prev_slow = ema(series[:-1], self.slow_period)
+        if None in {fast, mid, slow, prev_fast, prev_mid, prev_slow}:
+            return None
+        if not (prev_fast > prev_mid > prev_slow) and fast > mid > slow:
+            return 1, "triple ema alignment turned bullish"
+        if not (prev_fast < prev_mid < prev_slow) and fast < mid < slow:
+            return -1, "triple ema alignment turned bearish"
+        return None
+
+
+@dataclass(slots=True)
+class VwapMeanReversionStrategy(BaseKlineSignalStrategy):
+    period: int = 48
+    deviation_pct: float = 1.0
+
+    def required_bars(self) -> int:
+        return self.period + 5
+
+    def compute_signal(self, candles: list[Candle]) -> tuple[int, str] | None:
+        current_vwap = rolling_vwap(candles, self.period)
+        previous_vwap = rolling_vwap(candles[:-1], self.period)
+        if current_vwap is None or previous_vwap is None:
+            return None
+        lower_prev = previous_vwap * (1 - self.deviation_pct / 100)
+        upper_prev = previous_vwap * (1 + self.deviation_pct / 100)
+        lower_now = current_vwap * (1 - self.deviation_pct / 100)
+        upper_now = current_vwap * (1 + self.deviation_pct / 100)
+        close = candles[-1].close
+        prev_close = candles[-2].close
+        if prev_close <= lower_prev and close > lower_now:
+            return 1, "price recovered from below rolling vwap band"
+        if prev_close >= upper_prev and close < upper_now:
+            return -1, "price rejected from above rolling vwap band"
+        return None
+
+
+@dataclass(slots=True)
+class VolumeSpikeBreakoutStrategy(BaseKlineSignalStrategy):
+    lookback: int = 20
+    volume_mult: float = 1.8
+
+    def required_bars(self) -> int:
+        return self.lookback + 5
+
+    def compute_signal(self, candles: list[Candle]) -> tuple[int, str] | None:
+        if len(candles) < self.lookback + 1:
+            return None
+        previous_window = candles[-self.lookback - 1 : -1]
+        average_volume = fmean(item.volume for item in previous_window)
+        if candles[-1].volume < average_volume * self.volume_mult:
+            return None
+        close = candles[-1].close
+        if close > max(item.high for item in previous_window):
+            return 1, "high-volume upside range breakout"
+        if close < min(item.low for item in previous_window):
+            return -1, "high-volume downside range breakout"
+        return None
+
+
+@dataclass(slots=True)
+class HeikinAshiTrendStrategy(BaseKlineSignalStrategy):
+    consecutive_bars: int = 3
+
+    def required_bars(self) -> int:
+        return self.consecutive_bars + 20
+
+    def compute_signal(self, candles: list[Candle]) -> tuple[int, str] | None:
+        values = heikin_ashi(candles)
+        if len(values) < self.consecutive_bars + 1:
+            return None
+        recent = values[-self.consecutive_bars :]
+        previous_recent = values[-self.consecutive_bars - 1 : -1]
+
+        def bullish(row: tuple[float, float, float, float]) -> bool:
+            open_, _, low, close = row
+            return close > open_ and abs(low - min(open_, close)) <= 1e-9
+
+        def bearish(row: tuple[float, float, float, float]) -> bool:
+            open_, high, _, close = row
+            return close < open_ and abs(high - max(open_, close)) <= 1e-9
+
+        if all(bullish(row) for row in recent) and not all(bullish(row) for row in previous_recent):
+            return 1, f"{self.consecutive_bars} bullish heikin-ashi candles"
+        if all(bearish(row) for row in recent) and not all(bearish(row) for row in previous_recent):
+            return -1, f"{self.consecutive_bars} bearish heikin-ashi candles"
+        return None
+
+
+@dataclass(slots=True)
+class ChandelierTrendStrategy(BaseKlineSignalStrategy):
+    period: int = 22
+    atr_period: int = 14
+    atr_mult: float = 3.0
+
+    def required_bars(self) -> int:
+        return max(self.period, self.atr_period) + 10
+
+    def compute_signal(self, candles: list[Candle]) -> tuple[int, str] | None:
+        atr_value = atr(candles, self.atr_period)
+        prev_atr = atr(candles[:-1], self.atr_period)
+        if atr_value is None or prev_atr is None or len(candles) < self.period + 1:
+            return None
+        long_stop = max(item.high for item in candles[-self.period:]) - (atr_value * self.atr_mult)
+        short_stop = min(item.low for item in candles[-self.period:]) + (atr_value * self.atr_mult)
+        prev_long_stop = max(item.high for item in candles[-self.period - 1 : -1]) - (prev_atr * self.atr_mult)
+        prev_short_stop = min(item.low for item in candles[-self.period - 1 : -1]) + (prev_atr * self.atr_mult)
+        close = candles[-1].close
+        prev_close = candles[-2].close
+        if prev_close <= prev_long_stop and close > long_stop:
+            return 1, "close crossed above chandelier long stop"
+        if prev_close >= prev_short_stop and close < short_stop:
+            return -1, "close crossed below chandelier short stop"
+        return None
+
+
 STRATEGY_SPECS: dict[str, BuiltinStrategySpec] = {
     "sma_crossover": BuiltinStrategySpec(
         name="sma_crossover",
@@ -1144,6 +1403,96 @@ STRATEGY_SPECS: dict[str, BuiltinStrategySpec] = {
             "https://ta-lib.github.io/ta-doc/indicator/WILLR.htm",
         ],
     ),
+    "donchian_breakout": BuiltinStrategySpec(
+        name="donchian_breakout",
+        title="Donchian Breakout",
+        description="Close breaks above the prior Donchian high or below the prior Donchian low.",
+        category="volatility",
+        source_urls=[
+            "https://trendspider.com/learning-center/donchian-channel-trading-strategies/",
+            "https://finwiz.io/technical-indicators/donchian-channel",
+        ],
+    ),
+    "donchian_mean_reversion": BuiltinStrategySpec(
+        name="donchian_mean_reversion",
+        title="Donchian Mean Reversion",
+        description="Price stretches beyond a Donchian edge, then re-enters the channel.",
+        category="mean_reversion",
+        source_urls=[
+            "https://trendspider.com/learning-center/donchian-channel-trading-strategies/",
+            "https://finwiz.io/technical-indicators/donchian-channel",
+        ],
+    ),
+    "roc_momentum": BuiltinStrategySpec(
+        name="roc_momentum",
+        title="Rate-of-Change Momentum",
+        description="Price rate-of-change crosses from negative to positive momentum or vice versa.",
+        category="momentum",
+        source_urls=[
+            "https://ta-lib.github.io/ta-doc/indicator/ROC.htm",
+            "https://exfinder.io/en/blog/post/technical-analysis-indicators",
+        ],
+    ),
+    "ema_pullback": BuiltinStrategySpec(
+        name="ema_pullback",
+        title="EMA Trend Pullback",
+        description="Price recovers above a short EMA while aligned with a longer EMA trend.",
+        category="trend",
+        source_urls=[
+            "https://www.fidelity.com/learning-center/trading-investing/technical-analysis/technical-indicator-guide/ema",
+            "https://chartinglens.com/blog/rsi-macd-bollinger-bands-guide",
+        ],
+    ),
+    "triple_ma_trend": BuiltinStrategySpec(
+        name="triple_ma_trend",
+        title="Triple EMA Trend",
+        description="Fast, medium, and slow EMAs align into a bullish or bearish stack.",
+        category="trend",
+        source_urls=[
+            "https://www.fidelity.com/learning-center/trading-investing/technical-analysis/technical-indicator-guide/ema",
+            "https://exfinder.io/en/blog/post/technical-analysis-indicators",
+        ],
+    ),
+    "vwap_mean_reversion": BuiltinStrategySpec(
+        name="vwap_mean_reversion",
+        title="Rolling VWAP Mean Reversion",
+        description="Price moves outside a rolling VWAP deviation band, then starts reverting.",
+        category="mean_reversion",
+        source_urls=[
+            "https://trendspider.com/learning-center/technical-analysis-strategies/",
+            "https://forextester.com/blog/mean-reversion-trading/",
+        ],
+    ),
+    "volume_spike_breakout": BuiltinStrategySpec(
+        name="volume_spike_breakout",
+        title="Volume Spike Breakout",
+        description="Range breakout confirmed by unusually high volume.",
+        category="volume",
+        source_urls=[
+            "https://cryptoprofitcalc.com/which-are-the-best-indicators-for-crypto-trading-rsi-macd-ema-vwap-volume/",
+            "https://www.sharpnel-trading.com/learn/crypto-technical-analysis/",
+        ],
+    ),
+    "heikin_ashi_trend": BuiltinStrategySpec(
+        name="heikin_ashi_trend",
+        title="Heikin-Ashi Trend",
+        description="A run of directional Heikin-Ashi candles signals trend continuation.",
+        category="trend",
+        source_urls=[
+            "https://exfinder.io/en/blog/post/technical-analysis-indicators",
+            "https://cointester.io/indicators/technical",
+        ],
+    ),
+    "chandelier_trend": BuiltinStrategySpec(
+        name="chandelier_trend",
+        title="Chandelier Trend",
+        description="Close crosses ATR-based Chandelier stop levels.",
+        category="volatility",
+        source_urls=[
+            "https://www.fidelity.com/learning-center/trading-investing/technical-analysis/technical-indicator-guide/atr",
+            "https://exfinder.io/en/blog/post/technical-analysis-indicators",
+        ],
+    ),
 }
 
 
@@ -1169,6 +1518,15 @@ STRATEGY_FACTORIES: dict[str, Callable[..., BaseKlineSignalStrategy]] = {
     "keltner_breakout": KeltnerBreakoutStrategy,
     "ichimoku_trend": IchimokuTrendStrategy,
     "williams_r": WilliamsRStrategy,
+    "donchian_breakout": DonchianBreakoutStrategy,
+    "donchian_mean_reversion": DonchianMeanReversionStrategy,
+    "roc_momentum": RocMomentumStrategy,
+    "ema_pullback": EmaPullbackStrategy,
+    "triple_ma_trend": TripleMaTrendStrategy,
+    "vwap_mean_reversion": VwapMeanReversionStrategy,
+    "volume_spike_breakout": VolumeSpikeBreakoutStrategy,
+    "heikin_ashi_trend": HeikinAshiTrendStrategy,
+    "chandelier_trend": ChandelierTrendStrategy,
 }
 
 

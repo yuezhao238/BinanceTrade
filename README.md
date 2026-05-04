@@ -231,26 +231,32 @@ Or inspect the same dashboard payload without opening a browser:
 binance-trade dashboard-snapshot --no-portfolio
 ```
 
-The dashboard is now interactive, not read-only. It exposes a local control plane for:
+Starting the dashboard is passive: it only opens a local status console and reads current state. It does not start a daemon, submit orders, redeem Earn assets, or change runtime files until you click an explicit control.
+
+The dashboard exposes a local control plane for:
 
 - start / stop a runtime stack
 - start / stop a runtime profile
 - doctor a stack or profile
 - reconcile Spot open orders for a symbol
 - send manual Spot market buys or sells in `DRY_RUN`, `TEST`, or `LIVE`
+- edit runtime profile strategy parameters from the Automation panel
 - generate a deployable Spot runtime stack from the latest `Strategy Lab` allocation result
 
 The dashboard only exposes these white-listed actions. It does not run arbitrary shell commands.
 
-The dashboard is organized into two top-level workspaces:
+The dashboard is organized into three top-level workspaces:
 
-- `Live Console`
+- `Status`
+  - read the current environment, daemon state, Spot USDT availability, open-order count, stack health, runtime log, portfolio, and recent orders
+  - access manual controls such as reconcile, manual Spot order, and Earn-to-Spot redemption without starting automation
+- `Automation`
   - choose a runtime stack
-  - review the historical default budget for each profile
-  - edit each profile budget before start
+  - configure total budget and per-profile budget
+  - edit strategy parameters for each profile before start
   - launch or stop the daemon
   - watch live curves, current metrics, and recent strategy actions
-- `Research Lab`
+- `Strategy Lab`
   - benchmark the built-in strategy universe on one symbol / interval / assumption set
   - inspect per-strategy charts, buy/sell markers, and equity curves
   - inspect the simulated portfolio curve for the current allocation model
@@ -261,10 +267,11 @@ The dashboard is organized into two top-level workspaces:
 The intended high-level workflow is:
 
 1. Open the dashboard.
-2. In `Research Lab`, run a strategy scan for your market, symbol, interval, budget, and fee assumptions.
-3. Review the allocation candidates, portfolio curve, and per-strategy charts.
-4. Click `Generate Deployable Stack`.
-5. Switch back to `Live Console`, review or edit the generated per-profile budgets, then click `Start Daemon`.
+2. Confirm `Status` is healthy; the dashboard has not started trading.
+3. Click `Configure Automated Trading` or open `Strategy Lab`, then run a strategy scan for your market, symbol, interval, budget, and fee assumptions.
+4. Review the allocation candidates, portfolio curve, and per-strategy charts.
+5. Click `Generate Deployable Stack`.
+6. Switch to `Automation`, review or edit the generated parameters and per-profile budgets, then click `Start Daemon`.
 
 Generated stacks are written under:
 

@@ -184,6 +184,13 @@ class DashboardDataService:
             orders=orders,
             events=events,
         )
+        status_log = self._status_log(
+            stacks=stacks,
+            services=services,
+            orders=orders,
+            events=events,
+            runtime_files=runtime_files,
+        )
         return {
             "generated_at": utc_now_iso(),
             "environment": self.settings.binance_env.value,
@@ -204,6 +211,7 @@ class DashboardDataService:
             "portfolio": portfolio,
             "research": research,
             "deployment": deployment,
+            "status_log": status_log,
             "runtime_files": runtime_files,
             "controls": controls,
         }
@@ -463,6 +471,84 @@ class DashboardDataService:
             "created_at": item["created_at"],
             "payload_preview": _truncate_json(payload),
         }
+
+    def _status_log(
+        self,
+        *,
+        stacks: list[dict[str, Any]],
+        services: list[dict[str, Any]],
+        orders: list[dict[str, Any]],
+        events: list[dict[str, Any]],
+        runtime_files: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for item in stacks[:3]:
+            severity = "ok" if item["healthy"] else "error"
+            detail = f"{item['healthy_profile_count']}/{item['profile_count']} profiles healthy"
+            if item.get("error") or item.get("reason"):
+                detail = str(item.get("error") or item.get("reason"))
+            rows.append(
+                {
+                    "time": item.get("updated_at"),
+                    "severity": severity,
+                    "source": item["stack_name"],
+                    "title": f"Stack {item['status']}",
+                    "detail": detail,
+                }
+            )
+        for item in services[:6]:
+            severity = "ok" if item["healthy"] else ("warn" if item["status"] == "RUNNING" else "error")
+            detail = str(item.get("error") or item.get("reason") or f"restart_count={item.get('restart_count', 0)}")
+            rows.append(
+                {
+                    "time": item.get("updated_at"),
+                    "severity": severity,
+                    "source": item["service_name"],
+                    "title": f"{item['status']} / {item['submission_mode']}",
+                    "detail": detail,
+                }
+            )
+        for item in orders[:8]:
+            status = str(item.get("status") or "")
+            severity = "ok" if status == "FILLED" else ("warn" if item.get("is_open") else ("error" if status in {"LOCAL_REJECTED", "REJECTED"} else "info"))
+            amount = item.get("quote_order_qty") or item.get("quantity") or "-"
+            rows.append(
+                {
+                    "time": item.get("updated_at"),
+                    "severity": severity,
+                    "source": item.get("symbol"),
+                    "title": f"{item.get('side')} {status}",
+                    "detail": f"{amount} {item.get('order_type')} {item.get('submission_mode')}",
+                }
+            )
+        for item in events[:8]:
+            payload = item.get("payload_preview") or ""
+            event_type = item.get("event_type") or item.get("channel") or "event"
+            severity = "info"
+            if "error" in str(payload).lower() or "rejected" in str(payload).lower():
+                severity = "warn"
+            rows.append(
+                {
+                    "time": item.get("created_at"),
+                    "severity": severity,
+                    "source": item.get("symbol") or item.get("channel"),
+                    "title": str(event_type),
+                    "detail": payload,
+                }
+            )
+        for item in runtime_files[:4]:
+            if item.get("error"):
+                rows.append(
+                    {
+                        "time": item.get("updated_at"),
+                        "severity": "warn",
+                        "source": item.get("name"),
+                        "title": "runtime file warning",
+                        "detail": item.get("error"),
+                    }
+                )
+        rows.sort(key=lambda row: str(row.get("time") or ""), reverse=True)
+        return rows[:18]
 
     def _runtime_files(self) -> list[dict[str, Any]]:
         rows = []
@@ -875,6 +961,8 @@ class DashboardControlPlane:
             return self._research_scan(payload)
         if action == "generate_research_stack":
             return self._generate_research_stack(payload)
+        if action == "update_profile_params":
+            return self._update_profile_params(payload)
         if action == "refresh_portfolio":
             return {"status": "OK", "message": "Refresh portfolio by reloading the page or waiting for the next polling cycle."}
         raise ValueError(f"unsupported action {action!r}")
@@ -966,6 +1054,7 @@ class DashboardControlPlane:
             "strategy_label": _strategy_label(profile.strategy_ref),
             "budget_key": budget_key,
             "budget_value": None if budget_value is None else str(budget_value),
+            "params": {str(key): str(value) for key, value in profile.params.items()},
         }
 
     def _research_categories(self) -> list[dict[str, Any]]:
@@ -1121,7 +1210,37 @@ class DashboardControlPlane:
             updates.append({"profile_name": profile.name, "param": key, "value": rendered})
         return updates
 
-    def _write_profile_param(self, path: Path, key: str, value: str) -> None:
+    def _update_profile_params(self, payload: dict[str, Any]) -> dict[str, Any]:
+        path = self._resolve_path(self._required_identifier(payload, field="profile_path"))
+        profile = load_runtime_profile(path)
+        raw_params = payload.get("params")
+        if not isinstance(raw_params, dict):
+            raise ValueError("params must be an object")
+        if len(raw_params) > 40:
+            raise ValueError("too many params in one update")
+
+        updates: list[dict[str, str]] = []
+        for raw_key, raw_value in raw_params.items():
+            key = str(raw_key).strip()
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+                raise ValueError(f"invalid param key {key!r}")
+            value = str(raw_value).strip()
+            if value == "":
+                continue
+            quote = not re.fullmatch(r"-?\d+(\.\d+)?", value)
+            if key in {"symbol", "interval", "strategy_name", "trade_side", "quote_order_qty", "quantity"}:
+                quote = True
+            self._write_profile_param(path, key, value, quote=quote)
+            updates.append({"param": key, "value": value})
+
+        return {
+            "status": "OK",
+            "profile_name": profile.name,
+            "path": str(path),
+            "updates": updates,
+        }
+
+    def _write_profile_param(self, path: Path, key: str, value: str, *, quote: bool = True) -> None:
         text = path.read_text(encoding="utf-8")
         lines = text.splitlines()
         params_start = None
@@ -1137,7 +1256,8 @@ class DashboardControlPlane:
             raise ValueError(f"{path} is missing a [params] section")
 
         key_pattern = re.compile(rf"^\s*{re.escape(key)}\s*=")
-        replacement = f'{key} = "{value}"'
+        rendered = json.dumps(value) if quote else value
+        replacement = f"{key} = {rendered}"
         for index in range(params_start + 1, params_end):
             if key_pattern.match(lines[index]):
                 lines[index] = replacement
@@ -1978,18 +2098,19 @@ DASHBOARD_TEMPLATE = """<!doctype html>
   <title>BinanceTrade Ops Dashboard</title>
   <style>
     :root {
-      --bg: #f3efe7;
-      --panel: rgba(255,255,255,0.84);
-      --panel-strong: rgba(255,255,255,0.96);
-      --ink: #17161a;
-      --muted: #665f59;
-      --line: rgba(23,22,26,0.1);
-      --gold: #d39b2a;
-      --teal: #187d78;
-      --green: #13795b;
-      --red: #b43a3a;
-      --amber: #9b6a00;
-      --shadow: 0 18px 50px rgba(39, 28, 15, 0.12);
+      --bg: #080b10;
+      --panel: rgba(14,19,27,0.88);
+      --panel-strong: rgba(18,25,35,0.96);
+      --ink: #e8f0f2;
+      --muted: #8ea0aa;
+      --line: rgba(116,239,211,0.16);
+      --gold: #ffd166;
+      --teal: #54f0c8;
+      --green: #45d483;
+      --red: #ff5c7a;
+      --amber: #ffb020;
+      --shadow: 0 18px 70px rgba(0, 0, 0, 0.32);
+      --mono: "SF Mono", "JetBrains Mono", "Menlo", "Cascadia Code", monospace;
     }
     * { box-sizing: border-box; }
     body {
@@ -1997,9 +2118,12 @@ DASHBOARD_TEMPLATE = """<!doctype html>
       color: var(--ink);
       font-family: "Avenir Next", "SF Pro Display", "Segoe UI", sans-serif;
       background:
-        radial-gradient(circle at top left, rgba(211,155,42,0.18), transparent 34%),
-        radial-gradient(circle at bottom right, rgba(24,125,120,0.14), transparent 28%),
-        linear-gradient(180deg, #f8f4ec 0%, var(--bg) 100%);
+        linear-gradient(rgba(84,240,200,0.045) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(84,240,200,0.045) 1px, transparent 1px),
+        radial-gradient(circle at top left, rgba(84,240,200,0.16), transparent 30%),
+        radial-gradient(circle at bottom right, rgba(255,209,102,0.12), transparent 30%),
+        linear-gradient(180deg, #0b1018 0%, var(--bg) 100%);
+      background-size: 28px 28px, 28px 28px, auto, auto, auto;
     }
     .shell {
       width: min(1480px, calc(100vw - 32px));
@@ -2015,7 +2139,7 @@ DASHBOARD_TEMPLATE = """<!doctype html>
     .hero-card, .panel {
       background: var(--panel);
       border: 1px solid var(--line);
-      border-radius: 24px;
+      border-radius: 18px;
       box-shadow: var(--shadow);
       backdrop-filter: blur(16px);
     }
@@ -2041,7 +2165,7 @@ DASHBOARD_TEMPLATE = """<!doctype html>
       margin-bottom: 10px;
     }
     .hero h1 {
-      font-family: "Avenir Next Condensed", "Helvetica Neue", sans-serif;
+      font-family: var(--mono);
       font-size: clamp(32px, 4vw, 54px);
       line-height: 0.94;
       margin: 0 0 14px;
@@ -2059,7 +2183,9 @@ DASHBOARD_TEMPLATE = """<!doctype html>
       gap: 8px;
       padding: 8px 12px;
       border-radius: 999px;
-      background: rgba(23,22,26,0.06);
+      background: rgba(84,240,200,0.08);
+      border: 1px solid rgba(84,240,200,0.18);
+      font-family: var(--mono);
       font-size: 13px;
       margin-top: 18px;
     }
@@ -2086,10 +2212,11 @@ DASHBOARD_TEMPLATE = """<!doctype html>
     .metric {
       padding: 18px 18px 16px;
       background: var(--panel-strong);
-      border-radius: 20px;
+      border-radius: 16px;
       border: 1px solid var(--line);
     }
     .metric-label {
+      font-family: var(--mono);
       font-size: 12px;
       letter-spacing: 0.12em;
       text-transform: uppercase;
@@ -2097,6 +2224,7 @@ DASHBOARD_TEMPLATE = """<!doctype html>
       margin-bottom: 10px;
     }
     .metric-value {
+      font-family: var(--mono);
       font-size: clamp(24px, 3vw, 36px);
       font-weight: 700;
       letter-spacing: -0.04em;
@@ -2113,6 +2241,7 @@ DASHBOARD_TEMPLATE = """<!doctype html>
       margin: 0 0 14px;
       font-size: 18px;
       letter-spacing: -0.02em;
+      font-family: var(--mono);
     }
     .subtle {
       color: var(--muted);
@@ -2124,9 +2253,9 @@ DASHBOARD_TEMPLATE = """<!doctype html>
     }
     .service-card, .stack-card, .wallet-row, .runtime-file {
       padding: 14px;
-      background: rgba(255,255,255,0.74);
+      background: rgba(11,16,24,0.72);
       border: 1px solid var(--line);
-      border-radius: 16px;
+      border-radius: 14px;
     }
     .service-head, .stack-head, .wallet-head {
       display: flex;
@@ -2151,6 +2280,7 @@ DASHBOARD_TEMPLATE = """<!doctype html>
       letter-spacing: 0.08em;
       text-transform: uppercase;
       background: rgba(23,22,26,0.08);
+      font-family: var(--mono);
     }
     .pill.ok { background: rgba(19,121,91,0.12); color: var(--green); }
     .pill.warn { background: rgba(155,106,0,0.14); color: var(--amber); }
@@ -2210,7 +2340,7 @@ DASHBOARD_TEMPLATE = """<!doctype html>
     code {
       font-family: "SF Mono", "Menlo", monospace;
       font-size: 12px;
-      color: #56463a;
+      color: var(--teal);
       word-break: break-all;
     }
     .empty {
@@ -2234,13 +2364,14 @@ DASHBOARD_TEMPLATE = """<!doctype html>
     }
     .ops-card {
       padding: 14px;
-      border-radius: 18px;
+      border-radius: 16px;
       border: 1px solid var(--line);
-      background: rgba(255,255,255,0.78);
+      background: rgba(11,16,24,0.72);
     }
     .ops-card h3 {
       margin: 0 0 10px;
       font-size: 15px;
+      font-family: var(--mono);
     }
     .ops-form {
       display: grid;
@@ -2253,19 +2384,21 @@ DASHBOARD_TEMPLATE = """<!doctype html>
       letter-spacing: 0.08em;
       text-transform: uppercase;
       color: var(--muted);
+      font-family: var(--mono);
     }
     .ops-form input, .ops-form select, .ops-form button, .ops-row button {
       border: 1px solid var(--line);
-      border-radius: 12px;
+      border-radius: 10px;
       padding: 10px 12px;
       font: inherit;
-      background: rgba(255,255,255,0.96);
+      background: rgba(5,9,14,0.88);
       color: var(--ink);
     }
     .ops-form button, .ops-row button {
       cursor: pointer;
-      background: linear-gradient(180deg, #fffaf1 0%, #f0e1c3 100%);
+      background: linear-gradient(180deg, rgba(84,240,200,0.18) 0%, rgba(84,240,200,0.08) 100%);
       font-weight: 600;
+      font-family: var(--mono);
     }
     .ops-row {
       display: flex;
@@ -2277,7 +2410,7 @@ DASHBOARD_TEMPLATE = """<!doctype html>
       border-radius: 999px;
       padding: 10px 14px;
       font: inherit;
-      background: rgba(255,255,255,0.88);
+      background: rgba(11,16,24,0.86);
       color: var(--ink);
       cursor: pointer;
       transition: transform 140ms ease, background 140ms ease, border-color 140ms ease;
@@ -2293,9 +2426,70 @@ DASHBOARD_TEMPLATE = """<!doctype html>
       flex-wrap: wrap;
     }
     .panel-tab.active {
-      background: linear-gradient(180deg, #fffaf1 0%, #f0e1c3 100%);
-      border-color: rgba(211,155,42,0.4);
+      background: linear-gradient(180deg, rgba(84,240,200,0.22) 0%, rgba(84,240,200,0.08) 100%);
+      border-color: rgba(84,240,200,0.42);
       font-weight: 700;
+    }
+    .hero-actions {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-top: 18px;
+    }
+    .primary-action {
+      border: 1px solid rgba(84,240,200,0.48);
+      border-radius: 12px;
+      padding: 12px 16px;
+      cursor: pointer;
+      color: #06100e;
+      background: linear-gradient(180deg, var(--teal), #2fbd9d);
+      font-family: var(--mono);
+      font-weight: 800;
+      box-shadow: 0 0 28px rgba(84,240,200,0.18);
+    }
+    .secondary-action {
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 12px 16px;
+      cursor: pointer;
+      color: var(--ink);
+      background: rgba(11,16,24,0.74);
+      font-family: var(--mono);
+      font-weight: 700;
+    }
+    .readiness-strip {
+      display: grid;
+      gap: 10px;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      margin-bottom: 16px;
+    }
+    .readiness-card {
+      padding: 14px;
+      border-radius: 14px;
+      border: 1px solid var(--line);
+      background: rgba(11,16,24,0.7);
+    }
+    .readiness-card span {
+      display: block;
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 11px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      margin-bottom: 6px;
+    }
+    .readiness-card strong {
+      font-family: var(--mono);
+      font-size: 18px;
+    }
+    .deployment-param-grid {
+      display: grid;
+      gap: 8px;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      margin-top: 10px;
+    }
+    .deployment-param-grid label {
+      min-width: 0;
     }
     [data-panel].is-hidden {
       display: none !important;
@@ -2358,7 +2552,7 @@ DASHBOARD_TEMPLATE = """<!doctype html>
       padding: 12px;
       min-height: 72px;
       border-radius: 14px;
-      background: rgba(23,22,26,0.05);
+      background: rgba(84,240,200,0.06);
       border: 1px dashed rgba(23,22,26,0.15);
       font-family: "SF Mono", "Menlo", monospace;
       font-size: 12px;
@@ -2377,6 +2571,37 @@ DASHBOARD_TEMPLATE = """<!doctype html>
       display: grid;
       gap: 6px;
     }
+    .status-log {
+      display: grid;
+      gap: 8px;
+    }
+    .log-row {
+      display: grid;
+      grid-template-columns: 86px 92px 1fr;
+      gap: 12px;
+      align-items: start;
+      padding: 10px 0;
+      border-bottom: 1px solid var(--line);
+      font-size: 13px;
+    }
+    .log-row:last-child { border-bottom: 0; }
+    .log-source {
+      color: var(--muted);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .log-message strong {
+      display: block;
+      margin-bottom: 2px;
+    }
+    .log-message span {
+      color: var(--muted);
+      display: block;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
     .research-layout {
       display: grid;
       gap: 16px;
@@ -2386,7 +2611,7 @@ DASHBOARD_TEMPLATE = """<!doctype html>
       padding: 16px;
       border-radius: 18px;
       border: 1px solid var(--line);
-      background: rgba(255,255,255,0.78);
+      background: rgba(11,16,24,0.72);
     }
     .research-summary-grid,
     .candidate-metrics {
@@ -2397,7 +2622,7 @@ DASHBOARD_TEMPLATE = """<!doctype html>
     .mini-metric {
       padding: 10px 12px;
       border-radius: 14px;
-      background: rgba(23,22,26,0.05);
+      background: rgba(84,240,200,0.06);
       border: 1px solid rgba(23,22,26,0.07);
     }
     .mini-metric span {
@@ -2416,7 +2641,7 @@ DASHBOARD_TEMPLATE = """<!doctype html>
       padding: 16px;
       border-radius: 18px;
       border: 1px solid var(--line);
-      background: rgba(255,255,255,0.82);
+      background: rgba(11,16,24,0.74);
     }
     .candidate-chart-wrap {
       margin-top: 12px;
@@ -2424,7 +2649,7 @@ DASHBOARD_TEMPLATE = """<!doctype html>
       border: 1px solid var(--line);
       background:
         linear-gradient(180deg, rgba(211,155,42,0.06), transparent 45%),
-        linear-gradient(180deg, rgba(255,255,255,0.98), rgba(255,255,255,0.86));
+        linear-gradient(180deg, rgba(16,23,32,0.98), rgba(10,15,22,0.88));
       overflow: hidden;
     }
     .candidate-chart-svg {
@@ -2454,7 +2679,7 @@ DASHBOARD_TEMPLATE = """<!doctype html>
     .allocation-track {
       height: 10px;
       border-radius: 999px;
-      background: rgba(23,22,26,0.08);
+      background: rgba(84,240,200,0.10);
       overflow: hidden;
       margin-top: 10px;
     }
@@ -2484,7 +2709,7 @@ DASHBOARD_TEMPLATE = """<!doctype html>
       padding: 16px;
       border-radius: 20px;
       border: 1px solid var(--line);
-      background: rgba(255,255,255,0.82);
+      background: rgba(11,16,24,0.74);
     }
     .chart-meta {
       display: grid;
@@ -2505,7 +2730,7 @@ DASHBOARD_TEMPLATE = """<!doctype html>
       border: 1px solid var(--line);
       background:
         linear-gradient(180deg, rgba(24,125,120,0.05), transparent 38%),
-        linear-gradient(180deg, rgba(255,255,255,0.96), rgba(255,255,255,0.84));
+        linear-gradient(180deg, rgba(16,23,32,0.96), rgba(10,15,22,0.84));
       overflow: hidden;
     }
     .chart-svg {
@@ -2570,6 +2795,7 @@ DASHBOARD_TEMPLATE = """<!doctype html>
       .hero, .panel-grid { grid-template-columns: 1fr; }
       .wide { grid-column: span 1; }
       .ops-grid { grid-template-columns: 1fr 1fr; }
+      .readiness-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .deployment-layout,
       .research-layout,
       .chart-grid { grid-template-columns: 1fr; }
@@ -2579,6 +2805,7 @@ DASHBOARD_TEMPLATE = """<!doctype html>
     @media (max-width: 760px) {
       .shell { width: min(100vw - 20px, 100%); margin: 12px auto 28px; }
       .summary-grid, .split, .chart-meta, .research-summary-grid, .candidate-metrics { grid-template-columns: 1fr; }
+      .readiness-strip, .deployment-param-grid { grid-template-columns: 1fr; }
       .ops-grid { grid-template-columns: 1fr; }
     }
   </style>
@@ -2592,6 +2819,10 @@ DASHBOARD_TEMPLATE = """<!doctype html>
             <div class="eyebrow" data-i18n="hero.eyebrow">BinanceTrade Runtime</div>
             <h1 data-i18n="hero.title">Local Ops Dashboard</h1>
             <p data-i18n="hero.copy">A two-panel workspace for research and live trading. Configure a deployable budget, launch a daemon, and watch strategy curves, metrics, and actions update from the same local state.</p>
+            <div class="hero-actions">
+              <button type="button" class="primary-action" onclick="switchPanel('automation')" data-i18n="hero.configure">Configure Automated Trading</button>
+              <button type="button" class="secondary-action" onclick="switchPanel('status')" data-i18n="hero.status">View Current Status</button>
+            </div>
           </div>
           <button type="button" class="lang-toggle" id="langToggle" onclick="toggleLocale()">中文</button>
         </div>
@@ -2601,12 +2832,21 @@ DASHBOARD_TEMPLATE = """<!doctype html>
     </section>
 
     <nav class="panel-tabs" aria-label="Dashboard panels">
-      <button type="button" id="tabLive" class="panel-tab active" onclick="switchPanel('live')" data-i18n="tabs.live">Live Console</button>
-      <button type="button" id="tabResearch" class="panel-tab" onclick="switchPanel('research')" data-i18n="tabs.research">Research Lab</button>
+      <button type="button" id="tabStatus" class="panel-tab active" onclick="switchPanel('status')" data-i18n="tabs.status">Status</button>
+      <button type="button" id="tabAutomation" class="panel-tab" onclick="switchPanel('automation')" data-i18n="tabs.automation">Automation</button>
+      <button type="button" id="tabResearch" class="panel-tab" onclick="switchPanel('research')" data-i18n="tabs.research">Strategy Lab</button>
     </nav>
 
     <section class="panel-grid">
-      <section class="panel" data-panel="live">
+      <section class="panel wide" data-panel="status">
+        <div class="toolbar">
+          <h2 data-i18n="status.title">Current Status</h2>
+          <div class="subtle" data-i18n="status.subtitle">Read-only launch state. Starting the dashboard does not start trading.</div>
+        </div>
+        <div class="readiness-strip" id="readinessStrip"></div>
+      </section>
+
+      <section class="panel" data-panel="status">
         <div class="toolbar">
           <h2 data-i18n="stacks.title">Stacks</h2>
           <div class="subtle" id="environmentLabel"></div>
@@ -2614,7 +2854,7 @@ DASHBOARD_TEMPLATE = """<!doctype html>
         <div class="list" id="stackList"></div>
       </section>
 
-      <section class="panel" data-panel="live">
+      <section class="panel" data-panel="status">
         <div class="toolbar">
           <h2 data-i18n="services.title">Services</h2>
           <div class="subtle" data-i18n="services.subtitle">Daemon members and latest heartbeat</div>
@@ -2622,9 +2862,9 @@ DASHBOARD_TEMPLATE = """<!doctype html>
         <div class="list" id="serviceList"></div>
       </section>
 
-      <section class="panel wide" data-panel="live">
+      <section class="panel wide" data-panel="automation">
         <div class="toolbar">
-          <h2 data-i18n="deployment.title">Live Deployment</h2>
+          <h2 data-i18n="deployment.title">Automation Config</h2>
           <div class="subtle" id="deploymentStatus" data-i18n="deployment.subtitle">Choose a stack, review the historical budget suggestion for each strategy, then start the daemon.</div>
         </div>
         <div class="split deployment-layout">
@@ -2652,7 +2892,7 @@ DASHBOARD_TEMPLATE = """<!doctype html>
         </div>
       </section>
 
-      <section class="panel wide" data-panel="live">
+      <section class="panel wide" data-panel="automation status">
         <div class="toolbar">
           <h2 data-i18n="liveCharts.title">Live Strategy Charts</h2>
           <div class="subtle" data-i18n="liveCharts.subtitle">The chart stays as a blank coordinate frame until a daemon is running. Once started, each profile begins monitoring and the curve starts plotting live points.</div>
@@ -2660,9 +2900,21 @@ DASHBOARD_TEMPLATE = """<!doctype html>
         <div class="chart-grid" id="strategyChartList"></div>
       </section>
 
-      <section class="panel wide" data-panel="research">
+      <section class="panel wide" data-panel="status">
         <div class="toolbar">
-          <h2 data-i18n="research.title">Strategy Lab</h2>
+          <h2 data-i18n="statusLog.title">Runtime Log</h2>
+          <div class="subtle" data-i18n="statusLog.subtitle">Condensed daemon, order, reconcile, and user-stream status.</div>
+        </div>
+        <div class="status-log" id="statusLogPanel"></div>
+      </section>
+
+      <section class="panel wide" data-panel="status automation research">
+        <div class="response-box" id="actionResponse"><h3 data-i18n="advanced.actionCenter">Action Center</h3><div class="subtle" data-i18n="advanced.actionEmpty">No control action executed yet.</div></div>
+      </section>
+
+      <section class="panel wide" data-panel="automation research">
+        <div class="toolbar">
+          <h2 data-i18n="research.title">Strategy Market</h2>
           <div class="subtle" id="researchStatus" data-i18n="research.statusEmpty">No strategy scan has been run from the dashboard yet.</div>
         </div>
         <div class="research-layout">
@@ -2738,7 +2990,7 @@ DASHBOARD_TEMPLATE = """<!doctype html>
         </div>
       </section>
 
-      <section class="panel" data-panel="live">
+      <section class="panel" data-panel="status">
         <div class="toolbar">
           <h2 data-i18n="portfolio.title">Portfolio</h2>
           <div class="subtle" id="portfolioTime"></div>
@@ -2746,7 +2998,7 @@ DASHBOARD_TEMPLATE = """<!doctype html>
         <div id="portfolioPanel"></div>
       </section>
 
-      <section class="panel wide" data-panel="live">
+      <section class="panel wide" data-panel="status">
         <div class="toolbar">
           <h2 data-i18n="advanced.title">Advanced Operations</h2>
           <div class="subtle" data-i18n="advanced.subtitle">Manual runtime controls and wallet actions are still available here, but the primary workflow lives in the Live Deployment panel.</div>
@@ -2858,11 +3110,10 @@ DASHBOARD_TEMPLATE = """<!doctype html>
             </div>
           </article>
           </div>
-          <div class="response-box" id="actionResponse"><h3 data-i18n="advanced.actionCenter">Action Center</h3><div class="subtle" data-i18n="advanced.actionEmpty">No control action executed yet.</div></div>
         </details>
       </section>
 
-      <section class="panel wide" data-panel="live">
+      <section class="panel wide" data-panel="status">
         <div class="toolbar">
           <h2 data-i18n="orders.title">Recent Orders</h2>
           <div class="subtle" data-i18n="orders.subtitle">Newest first</div>
@@ -2870,23 +3121,26 @@ DASHBOARD_TEMPLATE = """<!doctype html>
         <div id="ordersPanel"></div>
       </section>
 
-      <section class="panel wide" data-panel="live">
-        <div class="split">
-          <div>
-            <div class="toolbar">
-              <h2 data-i18n="events.title">Recent Events</h2>
-              <div class="subtle" data-i18n="events.subtitle">User stream and reconciler activity</div>
+      <section class="panel wide" data-panel="status">
+        <details class="advanced-details">
+          <summary data-i18n="advanced.diagnostics">Open raw diagnostics</summary>
+          <div class="split" style="margin-top:14px">
+            <div>
+              <div class="toolbar">
+                <h2 data-i18n="events.title">Recent Events</h2>
+                <div class="subtle" data-i18n="events.subtitle">User stream and reconciler activity</div>
+              </div>
+              <div id="eventsPanel"></div>
             </div>
-            <div id="eventsPanel"></div>
-          </div>
-          <div>
-            <div class="toolbar">
-              <h2 data-i18n="files.title">Runtime Files</h2>
-              <div class="subtle" data-i18n="files.subtitle">Mirrored JSON heartbeat files</div>
+            <div>
+              <div class="toolbar">
+                <h2 data-i18n="files.title">Runtime Files</h2>
+                <div class="subtle" data-i18n="files.subtitle">Mirrored JSON heartbeat files</div>
+              </div>
+              <div class="list" id="runtimeFiles"></div>
             </div>
-            <div class="list" id="runtimeFiles"></div>
           </div>
-        </div>
+        </details>
       </section>
     </section>
   </div>
@@ -2896,22 +3150,27 @@ DASHBOARD_TEMPLATE = """<!doctype html>
     let currentControls = null;
     let currentSnapshot = null;
     let currentLocale = window.localStorage.getItem("dashboardLocale") || "en";
-    let currentPanel = window.localStorage.getItem("dashboardPanel") || "live";
-    let deploymentDraft = { stackPath: null, totalBudget: null, profileBudgets: {} };
+    let currentPanel = window.localStorage.getItem("dashboardPanel") || "status";
+    let deploymentDraft = { stackPath: null, totalBudget: null, profileBudgets: {}, profileParams: {} };
     const sectionHashes = {};
     const I18N = {
       en: {
         "hero.eyebrow": "BinanceTrade Runtime",
-        "hero.title": "Local Ops Dashboard",
-        "hero.copy": "A two-panel workspace for research and live trading. Configure a deployable budget, launch a daemon, and watch strategy curves, metrics, and actions update from the same local state.",
-        "tabs.live": "Live Console",
-        "tabs.research": "Research Lab",
+        "hero.title": "Ops Terminal",
+        "hero.copy": "Dashboard boot is passive: it only opens this local console and reads current state. Trading starts only after you explicitly configure and launch automation.",
+        "hero.configure": "Configure Automated Trading",
+        "hero.status": "View Current Status",
+        "tabs.status": "Status",
+        "tabs.automation": "Automation",
+        "tabs.research": "Strategy Lab",
+        "status.title": "Current Status",
+        "status.subtitle": "Read-only launch state. Starting the dashboard does not start trading.",
         "stacks.title": "Stacks",
         "services.title": "Services",
         "services.subtitle": "Daemon members and latest heartbeat",
-        "deployment.title": "Live Deployment",
-        "deployment.subtitle": "Choose a stack, review the historical budget suggestion for each strategy, then start the daemon.",
-        "deployment.plan": "Deployment Plan",
+        "deployment.title": "Automation Config",
+        "deployment.subtitle": "Tune strategy parameters and budgets first. The daemon starts only when you click Start Daemon.",
+        "deployment.plan": "Strategy Parameter Panel",
         "deployment.stack": "Runtime Stack",
         "deployment.totalBudget": "Total Budget (USDT)",
         "deployment.useSuggested": "Use Historical Defaults",
@@ -2920,7 +3179,9 @@ DASHBOARD_TEMPLATE = """<!doctype html>
         "deployment.hint": "Each budget is editable. The default suggestion is computed from recent historical replay for the profile when possible.",
         "liveCharts.title": "Live Strategy Charts",
         "liveCharts.subtitle": "The chart stays as a blank coordinate frame until a daemon is running. Once started, each profile begins monitoring and the curve starts plotting live points.",
-        "research.title": "Strategy Lab",
+        "statusLog.title": "Runtime Log",
+        "statusLog.subtitle": "Condensed daemon, order, reconcile, and user-stream status.",
+        "research.title": "Strategy Market",
         "research.statusEmpty": "No strategy scan has been run from the dashboard yet.",
         "research.scan": "Research Scan",
         "research.market": "Market",
@@ -2942,6 +3203,7 @@ DASHBOARD_TEMPLATE = """<!doctype html>
         "advanced.title": "Advanced Operations",
         "advanced.subtitle": "Manual runtime controls and wallet actions are still available here, but the primary workflow lives in the Live Deployment panel.",
         "advanced.open": "Open advanced runtime controls",
+        "advanced.diagnostics": "Open raw diagnostics",
         "advanced.stackControl": "Stack Control",
         "advanced.profileControl": "Profile Control",
         "advanced.runtimeProfile": "Runtime Profile",
@@ -3003,16 +3265,21 @@ DASHBOARD_TEMPLATE = """<!doctype html>
       },
       zh: {
         "hero.eyebrow": "BinanceTrade 运行时",
-        "hero.title": "本地交易控制台",
-        "hero.copy": "把研究和实盘运行放在同一工作台里：先配置预算，再启动 daemon，然后观察策略曲线、指标和操作记录如何沿着同一份本地状态实时更新。",
-        "tabs.live": "实时看板",
-        "tabs.research": "研究实验室",
+        "hero.title": "本地 Ops 终端",
+        "hero.copy": "启动 dashboard 是被动的：它只打开本地网页并读取当前状态。只有你显式配置并点击启动自动化后，才会启动交易 daemon。",
+        "hero.configure": "配置自动化交易",
+        "hero.status": "查看当前状态",
+        "tabs.status": "状态",
+        "tabs.automation": "自动化交易",
+        "tabs.research": "策略实验室",
+        "status.title": "当前状态",
+        "status.subtitle": "只读启动状态。运行 dashboard 命令本身不会开始交易。",
         "stacks.title": "组合栈",
         "services.title": "策略实例",
         "services.subtitle": "daemon 成员与最近心跳",
-        "deployment.title": "实时部署",
-        "deployment.subtitle": "先选择 stack，再查看每个策略的历史预算建议，然后一键启动 daemon。",
-        "deployment.plan": "部署方案",
+        "deployment.title": "自动化配置",
+        "deployment.subtitle": "先调策略参数和预算。只有点击启动 Daemon 后才会进入自动监控/交易。",
+        "deployment.plan": "策略参数面板",
         "deployment.stack": "运行栈",
         "deployment.totalBudget": "总预算（USDT）",
         "deployment.useSuggested": "使用历史建议",
@@ -3021,7 +3288,9 @@ DASHBOARD_TEMPLATE = """<!doctype html>
         "deployment.hint": "每个策略额度都可以手动调整；默认建议会尽量根据该 profile 的近期历史回放自动生成。",
         "liveCharts.title": "实时策略曲线",
         "liveCharts.subtitle": "启动前这里会显示空白坐标图。启动 daemon 后，每个策略开始监控，曲线会随着实时状态逐步打点。",
-        "research.title": "策略实验室",
+        "statusLog.title": "运行日志",
+        "statusLog.subtitle": "简洁汇总 daemon、订单、对账和用户流状态。",
+        "research.title": "策略市场",
         "research.statusEmpty": "还没有从 dashboard 发起过策略扫描。",
         "research.scan": "研究扫描",
         "research.market": "市场",
@@ -3043,6 +3312,7 @@ DASHBOARD_TEMPLATE = """<!doctype html>
         "advanced.title": "高级操作",
         "advanced.subtitle": "手动运行控制、钱包划转和临时下单仍然保留在这里，但日常主流程应该放在上面的实时部署面板。",
         "advanced.open": "展开高级运行控制",
+        "advanced.diagnostics": "展开原始诊断信息",
         "advanced.stackControl": "Stack 控制",
         "advanced.profileControl": "Profile 控制",
         "advanced.runtimeProfile": "运行 Profile",
@@ -3109,12 +3379,14 @@ DASHBOARD_TEMPLATE = """<!doctype html>
     }
 
     function switchPanel(panel) {
-      currentPanel = panel === "research" ? "research" : "live";
+      currentPanel = ["status", "automation", "research"].includes(panel) ? panel : "status";
       window.localStorage.setItem("dashboardPanel", currentPanel);
       document.querySelectorAll("[data-panel]").forEach((node) => {
-        node.classList.toggle("is-hidden", node.dataset.panel !== currentPanel);
+        const panels = String(node.dataset.panel || "").split(/\\s+/);
+        node.classList.toggle("is-hidden", !panels.includes(currentPanel));
       });
-      document.getElementById("tabLive").classList.toggle("active", currentPanel === "live");
+      document.getElementById("tabStatus").classList.toggle("active", currentPanel === "status");
+      document.getElementById("tabAutomation").classList.toggle("active", currentPanel === "automation");
       document.getElementById("tabResearch").classList.toggle("active", currentPanel === "research");
     }
 
@@ -3236,6 +3508,24 @@ DASHBOARD_TEMPLATE = """<!doctype html>
       ].join("");
     }
 
+    function renderReadiness(data) {
+      const node = document.getElementById("readinessStrip");
+      if (!node) return;
+      const summary = data?.summary || {};
+      const portfolio = data?.portfolio || {};
+      const spotUsdt = (portfolio.spot_balances || []).find((row) => String(row.asset || "").toUpperCase() === "USDT");
+      const earnUsdt = (portfolio.earn_positions || []).find((row) => String(row.asset || "").toUpperCase() === "USDT");
+      const running = Number(summary.healthy_service_count || 0);
+      const openOrders = Number(summary.open_order_count || 0);
+      const environment = data?.environment || "—";
+      node.innerHTML = [
+        `<div class="readiness-card"><span>mode</span><strong>${escapeHtml(environment)}</strong><div class="subtle">dashboard passive</div></div>`,
+        `<div class="readiness-card"><span>daemon</span><strong>${escapeHtml(running ? `${running} running` : "idle")}</strong><div class="subtle">no auto-start from dashboard boot</div></div>`,
+        `<div class="readiness-card"><span>spot usdt</span><strong>${escapeHtml(spotUsdt ? formatNumber(spotUsdt.free) : "—")}</strong><div class="subtle">available for direct spot orders</div></div>`,
+        `<div class="readiness-card"><span>orders</span><strong>${escapeHtml(openOrders)}</strong><div class="subtle">${escapeHtml(earnUsdt ? `Earn USDT ${formatNumber(earnUsdt.total_amount)}` : "no open local orders")}</div></div>`,
+      ].join("");
+    }
+
     function setOptions(selectId, rows, valueKey = "path", labelKey = "name") {
       const select = document.getElementById(selectId);
       if (!select) return;
@@ -3289,6 +3579,20 @@ DASHBOARD_TEMPLATE = """<!doctype html>
 
     function updateDeploymentBudget(name, value) {
       deploymentDraft.profileBudgets[name] = Number(value || 0);
+    }
+
+    function updateDeploymentParam(profileName, key, value) {
+      deploymentDraft.profileParams[profileName] = deploymentDraft.profileParams[profileName] || {};
+      deploymentDraft.profileParams[profileName][key] = value;
+    }
+
+    function saveProfileParams(profileName, profilePath) {
+      const params = deploymentDraft.profileParams?.[profileName] || {};
+      if (!Object.keys(params).length) {
+        postAction({ action: "update_profile_params", profile_path: profilePath, params: {} });
+        return;
+      }
+      postAction({ action: "update_profile_params", profile_path: profilePath, params });
     }
 
     function blankChartSvg(width, height, padX, padY) {
@@ -3357,6 +3661,9 @@ DASHBOARD_TEMPLATE = """<!doctype html>
           deploymentDraft.profileBudgets[profile.name] = Number(profile.suggested_budget || profile.current_budget || 0);
         });
       }
+      stack.profiles.forEach((profile) => {
+        deploymentDraft.profileParams[profile.name] = deploymentDraft.profileParams[profile.name] || { ...(profile.params || {}) };
+      });
 
       const totalBudgetInput = document.getElementById("deploymentTotalBudget");
       if (totalBudgetInput && document.activeElement !== totalBudgetInput) {
@@ -3369,7 +3676,15 @@ DASHBOARD_TEMPLATE = """<!doctype html>
 
       planNode.innerHTML = `
         <div class="deployment-profile-grid">
-          ${stack.profiles.map((profile) => `
+          ${stack.profiles.map((profile) => {
+            const params = deploymentDraft.profileParams[profile.name] || profile.params || {};
+            const paramRows = Object.entries(params).filter(([key]) => !String(key).startsWith("_")).map(([key, value]) => `
+              <label>
+                <span>${escapeHtml(key)}</span>
+                <input value="${escapeHtml(value)}" oninput="updateDeploymentParam('${escapeHtml(profile.name)}', '${escapeHtml(key)}', this.value)" />
+              </label>
+            `).join("");
+            return `
             <article class="deployment-profile-row">
               <div class="deployment-profile-head">
                 <div>
@@ -3386,9 +3701,13 @@ DASHBOARD_TEMPLATE = """<!doctype html>
                 <div><span>${escapeHtml(t("live.historicalWeight"))}</span>${escapeHtml(formatPercent(profile.suggested_weight_pct))}</div>
                 <div><span>${escapeHtml(t("live.mode"))}</span>${escapeHtml(profile.submission_mode || "PLANNED")}</div>
               </div>
+              <div class="deployment-param-grid">${paramRows}</div>
+              <div class="ops-row" style="margin-top:10px">
+                <button type="button" onclick="saveProfileParams('${escapeHtml(profile.name)}', '${escapeHtml(profile.path)}')">Save Params</button>
+              </div>
               <div class="subtle" style="margin-top:8px">${escapeHtml(profile.history_basis || t("live.noActivity"))}</div>
             </article>
-          `).join("")}
+          `}).join("")}
         </div>
       `;
 
@@ -3937,6 +4256,25 @@ DASHBOARD_TEMPLATE = """<!doctype html>
       `).join("");
     }
 
+    function renderStatusLog(rows) {
+      const node = document.getElementById("statusLogPanel");
+      if (!rows?.length) {
+        node.innerHTML = `<div class="empty">No runtime activity recorded yet.</div>`;
+        return;
+      }
+      node.innerHTML = rows.map((item) => `
+        <div class="log-row">
+          <span class="pill ${escapeHtml(item.severity || "info")}">${escapeHtml(item.severity || "info")}</span>
+          <div class="log-source" title="${escapeHtml(item.source || "runtime")}">${escapeHtml(item.source || "runtime")}</div>
+          <div class="log-message">
+            <strong>${escapeHtml(item.title || "event")}</strong>
+            <span title="${escapeHtml(item.detail || "")}">${escapeHtml(item.detail || "—")}</span>
+            <div class="subtle">${escapeHtml(formatTime(item.time) || item.time || "—")}</div>
+          </div>
+        </div>
+      `).join("");
+    }
+
     function renderActionFeedback(payload, response) {
       const node = document.getElementById("actionResponse");
       if (!response?.ok) {
@@ -4016,6 +4354,13 @@ DASHBOARD_TEMPLATE = """<!doctype html>
           `${result.stack?.profile_count || 0} profiles written`,
           `path ${result.stack?.path || "—"}`,
         ];
+      } else if (action === "update_profile_params") {
+        title = "Strategy Params Saved";
+        points = [
+          `${result.profile_name || "profile"} updated`,
+          `${(result.updates || []).length} params written`,
+          `path ${result.path || payload.profile_path || "—"}`,
+        ];
       } else {
         points = [result.status || "OK"];
       }
@@ -4037,12 +4382,12 @@ DASHBOARD_TEMPLATE = """<!doctype html>
           body: JSON.stringify(payload),
         });
         const data = await response.json();
-        if (data?.ok && payload.action === "generate_research_stack" && data.result?.stack?.path) {
-          deploymentDraft.stackPath = data.result.stack.path;
-          deploymentDraft.profileBudgets = {};
-          currentPanel = "live";
-          window.localStorage.setItem("dashboardPanel", currentPanel);
-        }
+      if (data?.ok && payload.action === "generate_research_stack" && data.result?.stack?.path) {
+        deploymentDraft.stackPath = data.result.stack.path;
+        deploymentDraft.profileBudgets = {};
+        currentPanel = "automation";
+        window.localStorage.setItem("dashboardPanel", currentPanel);
+      }
         renderActionFeedback(payload, data);
         await refresh();
       } catch (error) {
@@ -4195,6 +4540,7 @@ DASHBOARD_TEMPLATE = """<!doctype html>
       if (force) {
         Object.keys(sectionHashes).forEach((key) => delete sectionHashes[key]);
       }
+      updateSection("readiness", data, renderReadiness);
       updateSection("summary", data.summary, renderSummary);
       updateSection("stacks", data.stacks, renderStacks);
       updateSection("services", data.services, renderServices);
@@ -4202,6 +4548,7 @@ DASHBOARD_TEMPLATE = """<!doctype html>
       updateSection("portfolio", data.portfolio, renderPortfolio);
       updateSection("orders", data.orders, renderOrders);
       updateSection("events", data.events, renderEvents);
+      updateSection("status_log", data.status_log || [], renderStatusLog);
       updateSection("runtime_files", data.runtime_files, renderRuntimeFiles);
       updateSection("controls", data.controls, renderControls);
       updateSection(
